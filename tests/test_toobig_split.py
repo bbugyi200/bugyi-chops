@@ -115,7 +115,13 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert proposals[0]["wait_on"] is None
     assert proposals[1]["wait_on"] == proposals[0]["id"]
     assert proposals[2]["wait_on"] == proposals[1]["id"]
-    assert all(proposal["agent_name"].startswith("split_file.") for proposal in proposals)
+    assert [proposal["agent_name"] for proposal in proposals] == [
+        "split_file.src.pkg.large.1a5de906",
+        "split_file.src.pkg.shared.a534170a",
+        "split_file.tests.large.56df040d",
+    ]
+    assert all("@" not in proposal["agent_name"] for proposal in proposals)
+    assert all(proposal["clan"] == "toobig-@" for proposal in proposals)
     assert all(proposal["workspace"] == "gh:example/demo" for proposal in proposals)
     assert len({proposal["dedupe_key"] for proposal in proposals}) == 3
     assert calls.read_text(encoding="utf-8").splitlines() == [

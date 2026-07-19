@@ -26,6 +26,7 @@ from bugyi_chops._common import (
 )
 
 CHOP_NAME = "toobig_split"
+CLAN_TEMPLATE = "toobig-@"
 DEFAULT_TREES = ("src", "tests")
 DEFAULT_LIMITS = (1000, 850, 700)
 DETAIL_LIMIT_CHARS = 500
@@ -269,7 +270,7 @@ def _path_digest(path: str) -> str:
 def _agent_name(path: str) -> str:
     stem = Path(path).with_suffix("").as_posix()
     slug = safe_fragment(re.sub(r"[/\\]+", ".", stem), fallback="file")[:48]
-    return f"split_file.{slug}.{_path_digest(path)[:8]}-@"
+    return f"split_file.{slug}.{_path_digest(path)[:8]}"
 
 
 def _dedupe_key(repo_root: Path, workspace: str, path: str) -> str:
@@ -309,6 +310,7 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
             target.workspace,
             proposal_id=proposal_id,
             agent_name=_agent_name(path),
+            clan=CLAN_TEMPLATE,
             dedupe_key=_dedupe_key(target.repo_root, target.workspace, path),
             wait_on=prior_id,
         )

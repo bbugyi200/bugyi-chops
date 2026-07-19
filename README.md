@@ -30,7 +30,8 @@ For development against the repository rather than PyPI:
 sase plugin install bugyi-chops -g
 ```
 
-All scripts require Python 3.12 or newer and `sase>=0.12,<0.13`. The package also
+All scripts require Python 3.12 or newer and `sase>=0.12,<0.13`. SASE 0.12 is the
+first release with clan-scoped chop proposals. The package also
 installs the `toobig` scanner used by `bugyi_chop_toobig_split`.
 
 ## The chop result contract
@@ -67,10 +68,15 @@ references.
 normalizes and de-duplicates its paths, and emits one proposal per file. Each proposal
 has:
 
-- a `split_file.*` agent name, so `inhibit_if.agent_hood` can guard the whole batch;
+- the shared `toobig-@` clan template, with a stable marker-free `split_file.*`
+  member ID;
 - `%auto #split_file:<path>` as its prompt;
 - a content-sensitive dedupe key, so an unchanged file is not relaunched;
 - `wait_on` pointing to the prior file, preserving sequential workspace allocation.
+
+SASE allocates the clan template once per actionable scan, so concrete agent names
+look like `toobig-<token>.split_file.<path-slug>.<digest>`. All proposals from that
+scan belong to the same clan generation, while later scans can allocate a new one.
 
 The script deliberately has no flock, no `sase agent list`, and no `sase run`. Those
 responsibilities now belong to Axe:
@@ -86,7 +92,7 @@ axe:
           description: Split oversized Python files in sase
           run_every: 60m
           inhibit_if:
-            agent_hood: {hood: split_file}
+            agent_clan: {name_prefix: toobig-}
           for_each:
             source: projects
             names: [sase]
