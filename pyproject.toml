@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bugyi-chops"
+version = "0.1.0"
+description = "Personal proposal-emitting SASE axe chops"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Bryan Bugyi" }]
+maintainers = [{ name = "Bryan Bugyi" }]
+keywords = ["sase", "automation", "coding agents", "developer tools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
+]
+dependencies = [
+    "sase>=0.12.0,<0.13.0",
+    "toobig>=0.1.0,<0.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/bbugyi200/bugyi-chops"
+Repository = "https://github.com/bbugyi200/bugyi-chops"
+Issues = "https://github.com/bbugyi200/bugyi-chops/issues"
+
+[project.scripts]
+bugyi_chop_fix_just = "bugyi_chops.fix_just:main"
+bugyi_chop_recent_bug_audit = "bugyi_chops.recent_audits:bug_main"
+bugyi_chop_recent_improvement_audit = "bugyi_chops.recent_audits:improvement_main"
+bugyi_chop_toobig_split = "bugyi_chops.toobig_split:main"
+
+[dependency-groups]
+dev = [
+    "build>=1.2",
+    "mypy>=1.15",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.11",
+    "twine>=6.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bugyi_chops"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+    "/src",
+    "/tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["sase", "sase.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers --cov=bugyi_chops --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true

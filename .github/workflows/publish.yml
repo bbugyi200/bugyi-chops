@@ -1,0 +1,79 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  SASE_CORE_DIR: ${{ github.workspace }}/.deps/sase-core
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the SDK-bearing SASE source
+        uses: actions/checkout@v4
+        with:
+          repository: sase-org/sase
+          path: .deps/sase
+      - name: Check out the matching Rust core
+        uses: actions/checkout@v4
+        with:
+          repository: sase-org/sase-core
+          path: .deps/sase-core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: extractions/setup-just@v3
+      - name: Build and install the current SASE SDK and core
+        working-directory: .deps/sase
+        env:
+          UV_PYTHON: "3.12"
+        run: just install
+      - name: Install bugyi-chops into the SASE development environment
+        env:
+          BUGYI_CHOPS_VENV_BIN: ${{ github.workspace }}/.deps/sase/.venv/bin
+        run: just install
+      - name: Check package
+        env:
+          BUGYI_CHOPS_VENV_BIN: ${{ github.workspace }}/.deps/sase/.venv/bin
+        run: just check
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          .deps/sase/.venv/bin/python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          expected = f"v{version}"
+          if os.environ["RELEASE_TAG"] != expected:
+              raise SystemExit(f"tag {os.environ['RELEASE_TAG']!r} must equal {expected!r}")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/bugyi-chops
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-package
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  SASE_CORE_DIR: ${{ github.workspace }}/.deps/sase-core
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the SDK-bearing SASE source
+        uses: actions/checkout@v4
+        with:
+          repository: sase-org/sase
+          path: .deps/sase
+      - name: Check out the matching Rust core
+        uses: actions/checkout@v4
+        with:
+          repository: sase-org/sase-core
+          path: .deps/sase-core
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: extractions/setup-just@v3
+      - name: Build and install the current SASE SDK and core
+        working-directory: .deps/sase
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+        run: just install
+      - name: Install bugyi-chops into the SASE development environment
+        env:
+          BUGYI_CHOPS_VENV_BIN: ${{ github.workspace }}/.deps/sase/.venv/bin
+        run: just install
+      - name: Check package
+        env:
+          BUGYI_CHOPS_VENV_BIN: ${{ github.workspace }}/.deps/sase/.venv/bin
+        run: just check
