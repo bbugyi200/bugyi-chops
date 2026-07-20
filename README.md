@@ -1,13 +1,12 @@
 # bugyi-chops
 
 `bugyi-chops` is Bryan Bugyi's community [SASE](https://sase.sh/) plugin for
-scheduled Axe jobs that need to propose coding-agent work. It supplies four console
+scheduled Axe jobs that need to propose coding-agent work. It supplies three console
 scripts:
 
 | Script | What it proposes |
 | --- | --- |
 | `bugyi_chop_toobig_split` | One `%auto #split_file:<path>` agent per oversized Python file, chained in scan order |
-| `bugyi_chop_fix_just` | One focused agent that runs and repairs the repository's fmt, lint, and test gates |
 | `bugyi_chop_recent_bug_audit` | One recent-commit audit for confirmed correctness bugs |
 | `bugyi_chop_recent_improvement_audit` | One recent-commit audit for narrow, objective improvements |
 
@@ -107,31 +106,6 @@ environment variables are also accepted: `SASE_TOOBIG_SPLIT_PROJECT`,
 `SASE_TOOBIG_SPLIT_REPO_ROOT`, `SASE_TOOBIG_SPLIT_LAUNCH_REF`,
 `SASE_TOOBIG_SPLIT_TREES`, `SASE_TOOBIG_SPLIT_LIMITS`, and
 `SASE_TOOBIG_SPLIT_TOOBIG`.
-
-## `fix_just`
-
-`bugyi_chop_fix_just` emits one agent that runs `just install`, `just fmt-check`,
-`just lint`, and `just test`, fixes confirmed failures, and uses the `#pr(fix_just)`
-rollover workflow. Keep the overlap policy declarative:
-
-```yaml
-axe:
-  lumberjacks:
-    maintenance:
-      interval: 60
-      chops:
-        fix_just:
-          script: bugyi_chop_fix_just
-          run_every: 30m
-          inhibit_if:
-            changespec: {name_prefix: sase_fix_just}
-          once_per: "{proposal.id}"
-          vars:
-            workspace: gh:sase-org/sase
-```
-
-The workspace defaults to `gh:sase-org/sase`, but `target.workspace`,
-`vars.workspace`, or `BUGYI_CHOPS_WORKSPACE` can override it.
 
 ## Recent-commit audits
 
