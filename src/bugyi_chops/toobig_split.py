@@ -31,6 +31,7 @@ DEFAULT_TREES = ("src", "tests")
 DEFAULT_LIMITS = (1000, 850, 700)
 DETAIL_LIMIT_CHARS = 500
 ENV_PREFIX = "SASE_TOOBIG_SPLIT_"
+LAUNCH_PRIORITY = 20
 
 
 @dataclass(frozen=True)
@@ -306,7 +307,7 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
     for path in files:
         proposal_id = f"split-{_path_digest(path)}"
         result.propose(
-            f"%auto #split_file:{path}",
+            f"%auto %wait(priority={LAUNCH_PRIORITY}) #split_file:{path}",
             target.workspace,
             proposal_id=proposal_id,
             agent_name=_agent_name(path),

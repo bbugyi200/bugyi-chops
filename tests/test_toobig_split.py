@@ -108,9 +108,9 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert result["counters"] == {"files": 3, "proposals": 3, "trees": 2}
     proposals = result["proposed_launches"]
     assert [proposal["prompt"] for proposal in proposals] == [
-        "%auto #split_file:src/pkg/large.py",
-        "%auto #split_file:src/pkg/shared.py",
-        "%auto #split_file:tests/large.py",
+        "%auto %wait(priority=20) #split_file:src/pkg/large.py",
+        "%auto %wait(priority=20) #split_file:src/pkg/shared.py",
+        "%auto %wait(priority=20) #split_file:tests/large.py",
     ]
     assert proposals[0]["wait_on"] is None
     assert proposals[1]["wait_on"] == proposals[0]["id"]
@@ -152,7 +152,7 @@ def test_custom_tree_limits_and_legacy_env_target_resolution(
 
     proposal = result["proposed_launches"][0]
     assert proposal["workspace"] == "git:demo"
-    assert proposal["prompt"] == "%auto #split_file:lib/large.py"
+    assert proposal["prompt"] == "%auto %wait(priority=20) #split_file:lib/large.py"
     assert calls.read_text(encoding="utf-8").strip() == "--files-only lib 90 80 70"
 
 
@@ -328,8 +328,8 @@ def test_absolute_scanner_paths_are_normalized_and_missing_files_still_dedupe(
 
     proposals = result["proposed_launches"]
     assert [proposal["prompt"] for proposal in proposals] == [
-        "%auto #split_file:src/pkg/large.py",
-        "%auto #split_file:src/pkg/missing.py",
+        "%auto %wait(priority=20) #split_file:src/pkg/large.py",
+        "%auto %wait(priority=20) #split_file:src/pkg/missing.py",
     ]
     assert proposals[1]["dedupe_key"].endswith(":missing")
 
