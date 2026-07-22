@@ -69,13 +69,30 @@ has:
 
 - the shared `toobig-@` clan template, with a stable marker-free `split_file.*`
   member ID;
+- the same Rich `clan_summary` metadata, describing the mission, file and scan-root
+  counts, configured limits, and sequential queue;
 - `%auto #split_file:<path>` as its prompt;
 - a content-sensitive dedupe key, so an unchanged file is not relaunched;
 - `wait_on` pointing to the prior file, preserving sequential workspace allocation.
 
-SASE allocates the clan template once per actionable scan, so concrete agent names
-look like `toobig-<token>.split_file.<path-slug>.<digest>`. All proposals from that
-scan belong to the same clan generation, while later scans can allocate a new one.
+The repeated summary metadata is deliberate: after deduplication, any surviving
+proposal can safely become the clan declarer. Axe allocates the concrete clan template
+once per actionable scan and emits the summary exactly once on that declaration; clan
+joiners do not redeclare it. In ACE the default scan reads as:
+
+```text
+◆ TOOBIG SPLIT · 3 FILES
+MISSION
+Decompose oversized Python modules into focused, reviewable units
+without changing behavior.
+2 scan roots · limits 1,000 / 850 / 700 lines · sequential queue
+```
+
+Concrete agent names look like
+`toobig-<token>.split_file.<path-slug>.<digest>`. All proposals from that scan
+belong to the same clan generation, while later scans can allocate a new one. The
+plugin authors only the `toobig-@` template and proposal metadata; Axe alone chooses
+the concrete clan name, injects declaration/join directives, and launches agents.
 
 The script deliberately has no flock, no `sase agent list`, and no `sase run`. Those
 responsibilities now belong to Axe:

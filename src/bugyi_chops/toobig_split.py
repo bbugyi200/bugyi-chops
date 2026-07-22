@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from rich.text import Text
 from sase.chops import ChopInvocation, ChopResultBuilder
 
 from bugyi_chops._common import (
@@ -32,6 +33,11 @@ DEFAULT_LIMITS = (1000, 850, 700)
 DETAIL_LIMIT_CHARS = 500
 ENV_PREFIX = "SASE_TOOBIG_SPLIT_"
 LAUNCH_PRIORITY = 20
+CLAN_SUMMARY_WIDTH = 76
+CLAN_SUMMARY_HEADER_STYLE = "bold #D75FFF"
+CLAN_SUMMARY_SECTION_STYLE = "bold #87D7FF"
+CLAN_SUMMARY_MISSION_STYLE = "dim #D7D7FF"
+CLAN_SUMMARY_FACTS_STYLE = "dim #A8A8A8"
 
 
 @dataclass(frozen=True)
@@ -283,6 +289,32 @@ def _dedupe_key(repo_root: Path, workspace: str, path: str) -> str:
     return f"toobig_split:{workspace}:{path}:{content_digest}"
 
 
+def _render_clan_summary(
+    file_count: int,
+    tree_count: int,
+    limits: tuple[int, int, int],
+) -> str:
+    file_label = "FILE" if file_count == 1 else "FILES"
+    limit_text = " / ".join(f"{limit:,}" for limit in limits)
+    lines = (
+        Text(
+            f"◆ TOOBIG SPLIT · {file_count} {file_label}",
+            style=CLAN_SUMMARY_HEADER_STYLE,
+        ),
+        Text("MISSION", style=CLAN_SUMMARY_SECTION_STYLE),
+        Text(
+            "Decompose oversized Python modules into focused, reviewable units",
+            style=CLAN_SUMMARY_MISSION_STYLE,
+        ),
+        Text("without changing behavior.", style=CLAN_SUMMARY_MISSION_STYLE),
+        Text(
+            f"{tree_count} scan roots · limits {limit_text} lines · sequential queue",
+            style=CLAN_SUMMARY_FACTS_STYLE,
+        ),
+    )
+    return "\n".join(line.markup for line in lines)
+
+
 def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
     target = _resolve_target(invocation)
     trees = _trees(invocation)
@@ -303,6 +335,7 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
         CHOP_NAME,
         {"trees": len(trees), "files": len(files), "proposals": len(files)},
     )
+    clan_summary = _render_clan_summary(len(files), len(trees), limits)
     prior_id: str | None = None
     for path in files:
         proposal_id = f"split-{_path_digest(path)}"
@@ -312,6 +345,7 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
             proposal_id=proposal_id,
             agent_name=_agent_name(path),
             clan=CLAN_TEMPLATE,
+            clan_summary=clan_summary,
             dedupe_key=_dedupe_key(target.repo_root, target.workspace, path),
             wait_on=prior_id,
         )
