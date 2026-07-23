@@ -9,10 +9,12 @@ import re
 import shlex
 import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from rich.cells import cell_len
 from rich.text import Text
 from sase.chops import ChopInvocation, ChopResultBuilder
 
@@ -34,16 +36,31 @@ DETAIL_LIMIT_CHARS = 500
 ENV_PREFIX = "SASE_TOOBIG_SPLIT_"
 LAUNCH_PRIORITY = 20
 CLAN_SUMMARY_WIDTH = 76
+CLAN_SUMMARY_MAX_ROWS = 10
 CLAN_SUMMARY_HEADER_STYLE = "bold #D75FFF"
 CLAN_SUMMARY_SECTION_STYLE = "bold #87D7FF"
 CLAN_SUMMARY_MISSION_STYLE = "dim #D7D7FF"
 CLAN_SUMMARY_FACTS_STYLE = "dim #A8A8A8"
+CLAN_SUMMARY_VIOLATION_STYLE = "bold #FF5F87"
+CLAN_SUMMARY_WARNING_STYLE = "bold #FFAF5F"
+CLAN_SUMMARY_FYI_STYLE = "#87D7FF"
+CLAN_SUMMARY_NEUTRAL_STYLE = "dim #A8A8A8"
+CLAN_SUMMARY_VIOLATION_GLYPH = "▲"
+CLAN_SUMMARY_WARNING_GLYPH = "◆"
+CLAN_SUMMARY_FYI_GLYPH = "•"
+CLAN_SUMMARY_NEUTRAL_GLYPH = "·"
 
 
 @dataclass(frozen=True)
 class ScanTarget:
     repo_root: Path
     workspace: str
+
+
+@dataclass(frozen=True)
+class FileEntry:
+    path: str
+    line_count: int | None
 
 
 def _env(name: str) -> str | None:
@@ -289,14 +306,68 @@ def _dedupe_key(repo_root: Path, workspace: str, path: str) -> str:
     return f"toobig_split:{workspace}:{path}:{content_digest}"
 
 
+def _line_count(path: Path) -> int | None:
+    try:
+        return path.read_bytes().count(b"\n")
+    except OSError:
+        return None
+
+
+def _classify(line_count: int | None, limits: tuple[int, int, int]) -> str:
+    if line_count is None:
+        return "unknown"
+    if line_count > limits[0]:
+        return "violation"
+    if line_count > limits[1]:
+        return "warning"
+    if line_count > limits[2]:
+        return "fyi"
+    return "neutral"
+
+
+def _elide_path(path: str, max_cells: int) -> str:
+    if max_cells <= 0:
+        return ""
+    if cell_len(path) <= max_cells:
+        return path
+
+    prefix = "…/"
+    if max_cells <= cell_len(prefix):
+        return prefix[:max_cells]
+    for start, character in enumerate(path):
+        if character != "/":
+            continue
+        candidate = prefix + path[start + 1 :]
+        if cell_len(candidate) <= max_cells:
+            return candidate
+    for start in range(1, len(path) + 1):
+        candidate = prefix + path[start:].lstrip("/")
+        if cell_len(candidate) <= max_cells:
+            return candidate
+    return prefix
+
+
+def _severity_display(severity: str) -> tuple[str, str]:
+    if severity == "violation":
+        return CLAN_SUMMARY_VIOLATION_GLYPH, CLAN_SUMMARY_VIOLATION_STYLE
+    if severity == "warning":
+        return CLAN_SUMMARY_WARNING_GLYPH, CLAN_SUMMARY_WARNING_STYLE
+    if severity == "fyi":
+        return CLAN_SUMMARY_FYI_GLYPH, CLAN_SUMMARY_FYI_STYLE
+    return CLAN_SUMMARY_NEUTRAL_GLYPH, CLAN_SUMMARY_NEUTRAL_STYLE
+
+
 def _render_clan_summary(
-    file_count: int,
+    entries: Sequence[FileEntry],
     tree_count: int,
     limits: tuple[int, int, int],
+    *,
+    max_rows: int = CLAN_SUMMARY_MAX_ROWS,
 ) -> str:
+    file_count = len(entries)
     file_label = "FILE" if file_count == 1 else "FILES"
     limit_text = " / ".join(f"{limit:,}" for limit in limits)
-    lines = (
+    lines = [
         Text(
             f"◆ TOOBIG SPLIT · {file_count} {file_label}",
             style=CLAN_SUMMARY_HEADER_STYLE,
@@ -307,10 +378,42 @@ def _render_clan_summary(
             style=CLAN_SUMMARY_MISSION_STYLE,
         ),
         Text("without changing behavior.", style=CLAN_SUMMARY_MISSION_STYLE),
-        Text(
-            f"{tree_count} scan roots · limits {limit_text} lines · sequential queue",
-            style=CLAN_SUMMARY_FACTS_STYLE,
+        Text(""),
+        Text("TARGETS", style=CLAN_SUMMARY_SECTION_STYLE),
+    ]
+
+    sorted_entries = sorted(
+        entries,
+        key=lambda entry: (
+            entry.line_count is None,
+            -entry.line_count if entry.line_count is not None else 0,
+            entry.path,
         ),
+    )
+    displayed_entries = sorted_entries[: max(0, max_rows)]
+    count_strings = [
+        f"{entry.line_count:,}" if entry.line_count is not None else "?"
+        for entry in displayed_entries
+    ]
+    count_width = max((len(count) for count in count_strings), default=1)
+    path_cells = CLAN_SUMMARY_WIDTH - (2 + count_width + 2)
+    for entry, count_string in zip(displayed_entries, count_strings, strict=True):
+        severity = _classify(entry.line_count, limits)
+        glyph, style = _severity_display(severity)
+        path = _elide_path(entry.path, path_cells)
+        lines.append(Text(f"{glyph} {count_string:>{count_width}}  {path}", style=style))
+
+    overflow = file_count - len(displayed_entries)
+    if overflow:
+        lines.append(Text(f"…and {overflow} more", style=CLAN_SUMMARY_FACTS_STYLE))
+    lines.extend(
+        [
+            Text(""),
+            Text(
+                f"{tree_count} scan roots · limits {limit_text} lines · sequential queue",
+                style=CLAN_SUMMARY_FACTS_STYLE,
+            ),
+        ]
     )
     return "\n".join(line.markup for line in lines)
 
@@ -335,7 +438,10 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
         CHOP_NAME,
         {"trees": len(trees), "files": len(files), "proposals": len(files)},
     )
-    clan_summary = _render_clan_summary(len(files), len(trees), limits)
+    entries = [
+        FileEntry(path=path, line_count=_line_count(target.repo_root / path)) for path in files
+    ]
+    clan_summary = _render_clan_summary(entries, len(trees), limits)
     prior_id: str | None = None
     for path in files:
         proposal_id = f"split-{_path_digest(path)}"

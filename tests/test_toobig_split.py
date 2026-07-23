@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from rich.cells import cell_len
 from rich.style import Style
 from rich.text import Text
 from sase.axe.chop_proposals import plan_chop_proposals, prepare_chop_proposals
@@ -16,20 +17,27 @@ from sase.xprompt.directives import extract_prompt_directives
 
 from bugyi_chops.toobig_split import (
     CLAN_SUMMARY_FACTS_STYLE,
+    CLAN_SUMMARY_FYI_STYLE,
     CLAN_SUMMARY_HEADER_STYLE,
+    CLAN_SUMMARY_MAX_ROWS,
     CLAN_SUMMARY_MISSION_STYLE,
+    CLAN_SUMMARY_NEUTRAL_STYLE,
     CLAN_SUMMARY_SECTION_STYLE,
+    CLAN_SUMMARY_VIOLATION_STYLE,
+    CLAN_SUMMARY_WARNING_STYLE,
     CLAN_SUMMARY_WIDTH,
+    FileEntry,
+    _elide_path,
+    _line_count,
     _render_clan_summary,
     main,
 )
 
-CANONICAL_SUMMARY_PLAIN = """\
-◆ TOOBIG SPLIT · 3 FILES
-MISSION
-Decompose oversized Python modules into focused, reviewable units
-without changing behavior.
-2 scan roots · limits 1,000 / 850 / 700 lines · sequential queue"""
+MISSION_LINES = [
+    "MISSION",
+    "Decompose oversized Python modules into focused, reviewable units",
+    "without changing behavior.",
+]
 
 
 def _fake_toobig(tmp_path: Path) -> Path:
@@ -105,38 +113,162 @@ def _prepare_repo(tmp_path: Path) -> Path:
 
 
 def test_clan_summary_has_canonical_text_styles_and_width() -> None:
-    summary = _render_clan_summary(3, 2, (1000, 850, 700))
+    summary = _render_clan_summary(
+        [
+            FileEntry("sase/ace/tui/app.py", 1_214),
+            FileEntry("sase/axe/run_agent_runner.py", 902),
+            FileEntry("tests/deep/path/test_foo.py", 731),
+        ],
+        2,
+        (1000, 850, 700),
+    )
     rendered = Text.from_markup(summary)
 
-    assert rendered.plain == CANONICAL_SUMMARY_PLAIN
+    assert rendered.plain.splitlines() == [
+        "◆ TOOBIG SPLIT · 3 FILES",
+        *MISSION_LINES,
+        "",
+        "TARGETS",
+        "▲ 1,214  sase/ace/tui/app.py",
+        "◆   902  sase/axe/run_agent_runner.py",
+        "•   731  tests/deep/path/test_foo.py",
+        "",
+        "2 scan roots · limits 1,000 / 850 / 700 lines · sequential queue",
+    ]
     lines = rendered.split("\n")
-    assert len(lines) == 5
-    assert [Style.parse(str(line.spans[0].style)) for line in lines] == [
+    styled_lines = [line for line in lines if line.plain]
+    assert [Style.parse(str(line.spans[0].style)) for line in styled_lines] == [
         Style.parse(CLAN_SUMMARY_HEADER_STYLE),
         Style.parse(CLAN_SUMMARY_SECTION_STYLE),
         Style.parse(CLAN_SUMMARY_MISSION_STYLE),
         Style.parse(CLAN_SUMMARY_MISSION_STYLE),
+        Style.parse(CLAN_SUMMARY_SECTION_STYLE),
+        Style.parse(CLAN_SUMMARY_VIOLATION_STYLE),
+        Style.parse(CLAN_SUMMARY_WARNING_STYLE),
+        Style.parse(CLAN_SUMMARY_FYI_STYLE),
         Style.parse(CLAN_SUMMARY_FACTS_STYLE),
     ]
     assert all(
         len(line.spans) == 1 and line.spans[0].start == 0 and line.spans[0].end == len(line)
-        for line in lines
+        for line in styled_lines
     )
     assert max(line.cell_len for line in lines) <= CLAN_SUMMARY_WIDTH
+    assert "]]" not in summary
 
 
 def test_clan_summary_handles_one_file_and_formats_custom_limits() -> None:
-    summary = _render_clan_summary(1, 3, (12_000, 3_456, 1_001))
+    summary = _render_clan_summary(
+        [FileEntry("src/only.py", 1_002)],
+        3,
+        (12_000, 3_456, 1_001),
+    )
     rendered = Text.from_markup(summary)
 
     assert rendered.plain.splitlines() == [
         "◆ TOOBIG SPLIT · 1 FILE",
-        "MISSION",
-        "Decompose oversized Python modules into focused, reviewable units",
-        "without changing behavior.",
+        *MISSION_LINES,
+        "",
+        "TARGETS",
+        "• 1,002  src/only.py",
+        "",
         "3 scan roots · limits 12,000 / 3,456 / 1,001 lines · sequential queue",
     ]
     assert max(line.cell_len for line in rendered.split("\n")) <= CLAN_SUMMARY_WIDTH
+
+
+def test_clan_summary_renders_mixed_severities_with_redundant_glyphs() -> None:
+    summary = _render_clan_summary(
+        [
+            FileEntry("src/neutral.py", 700),
+            FileEntry("src/fyi.py", 701),
+            FileEntry("src/warning.py", 851),
+            FileEntry("src/violation.py", 1_001),
+        ],
+        1,
+        (1000, 850, 700),
+    )
+    lines = Text.from_markup(summary).split("\n")
+    target_rows = lines[6:10]
+
+    assert [line.plain for line in target_rows] == [
+        "▲ 1,001  src/violation.py",
+        "◆   851  src/warning.py",
+        "•   701  src/fyi.py",
+        "·   700  src/neutral.py",
+    ]
+    assert [Style.parse(str(line.spans[0].style)) for line in target_rows] == [
+        Style.parse(CLAN_SUMMARY_VIOLATION_STYLE),
+        Style.parse(CLAN_SUMMARY_WARNING_STYLE),
+        Style.parse(CLAN_SUMMARY_FYI_STYLE),
+        Style.parse(CLAN_SUMMARY_NEUTRAL_STYLE),
+    ]
+
+
+def test_clan_summary_elides_a_long_path_from_the_left() -> None:
+    long_path = "src/" + "/".join(["deeply_nested_package"] * 6) + "/test_foo.py"
+    summary = _render_clan_summary(
+        [FileEntry(long_path, 1_234)],
+        1,
+        (1000, 850, 700),
+    )
+    target_row = Text.from_markup(summary).split("\n")[6]
+    rendered_path = target_row.plain.split("  ", 1)[1]
+
+    assert rendered_path.startswith("…/")
+    assert rendered_path.endswith("/test_foo.py")
+    assert long_path not in target_row.plain
+    assert target_row.cell_len <= CLAN_SUMMARY_WIDTH
+    assert _elide_path("src/short.py", 20) == "src/short.py"
+    assert cell_len(_elide_path(long_path, 20)) <= 20
+
+
+def test_clan_summary_sorts_unknown_counts_last_and_aligns_count_column() -> None:
+    summary = _render_clan_summary(
+        [
+            FileEntry("src/missing.py", None),
+            FileEntry("src/small.py", 9),
+            FileEntry("src/largest.py", 12_345),
+        ],
+        1,
+        (1000, 850, 700),
+    )
+    target_rows = Text.from_markup(summary).split("\n")[6:9]
+
+    assert [line.plain for line in target_rows] == [
+        "▲ 12,345  src/largest.py",
+        "·      9  src/small.py",
+        "·      ?  src/missing.py",
+    ]
+    assert Style.parse(str(target_rows[-1].spans[0].style)) == Style.parse(
+        CLAN_SUMMARY_NEUTRAL_STYLE
+    )
+    assert len({line.plain.index("src/") for line in target_rows}) == 1
+
+
+def test_clan_summary_caps_target_rows_and_reports_overflow() -> None:
+    entries = [
+        FileEntry(f"src/file_{index:02}.py", 2_000 - index)
+        for index in range(CLAN_SUMMARY_MAX_ROWS + 2)
+    ]
+    summary = _render_clan_summary(entries, 2, (1000, 850, 700))
+    lines = Text.from_markup(summary).split("\n")
+    target_block = lines[6:-2]
+
+    assert lines[0].plain == f"◆ TOOBIG SPLIT · {len(entries)} FILES"
+    assert len(target_block) == CLAN_SUMMARY_MAX_ROWS + 1
+    assert target_block[-1].plain == "…and 2 more"
+    assert Style.parse(str(target_block[-1].spans[0].style)) == Style.parse(
+        CLAN_SUMMARY_FACTS_STYLE
+    )
+    assert max(line.cell_len for line in lines) <= CLAN_SUMMARY_WIDTH
+
+
+def test_line_count_uses_newline_semantics_and_handles_missing_files(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_bytes(b"first\nsecond\nunterminated")
+
+    assert _line_count(source) == 2
+    assert _line_count(tmp_path / "missing.py") is None
 
 
 def test_scan_deduplicates_files_and_emits_stable_wait_chain(
@@ -179,7 +311,12 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert all("@" not in proposal["agent_name"] for proposal in proposals)
     assert all(proposal["clan"] == "toobig-@" for proposal in proposals)
     assert {proposal["clan_summary"] for proposal in proposals} == {proposals[0]["clan_summary"]}
-    assert Text.from_markup(proposals[0]["clan_summary"]).plain == CANONICAL_SUMMARY_PLAIN
+    summary_plain = Text.from_markup(proposals[0]["clan_summary"]).plain
+    assert "◆ TOOBIG SPLIT · 3 FILES" in summary_plain
+    assert "2 scan roots · limits 1,000 / 850 / 700 lines · sequential queue" in summary_plain
+    assert "src/pkg/large.py" in summary_plain
+    assert "src/pkg/shared.py" in summary_plain
+    assert "tests/large.py" in summary_plain
     assert all(proposal["workspace"] == "gh:example/demo" for proposal in proposals)
     assert len({proposal["dedupe_key"] for proposal in proposals}) == 3
     assert calls.read_text(encoding="utf-8").splitlines() == [
@@ -442,6 +579,7 @@ def test_absolute_scanner_paths_are_normalized_and_missing_files_still_dedupe(
         "%auto %wait(priority=20) #split_file:src/pkg/missing.py",
     ]
     assert proposals[1]["dedupe_key"].endswith(":missing")
+    assert "· ?" in Text.from_markup(proposals[1]["clan_summary"]).plain
 
 
 @pytest.mark.parametrize(
