@@ -293,8 +293,8 @@ def _path_digest(path: str) -> str:
 
 def _agent_name(path: str) -> str:
     stem = Path(path).with_suffix("").as_posix()
-    slug = safe_fragment(re.sub(r"[/\\]+", ".", stem), fallback="file")[:48]
-    return f"split_file.{slug}.{_path_digest(path)[:8]}"
+    slug = safe_fragment(re.sub(r"[/\\]+", ".", stem), fallback="file")
+    return f"split_file.{slug}.@"
 
 
 def _dedupe_key(repo_root: Path, workspace: str, path: str) -> str:

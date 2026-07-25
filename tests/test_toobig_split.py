@@ -304,11 +304,14 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert proposals[1]["wait_on"] == proposals[0]["id"]
     assert proposals[2]["wait_on"] == proposals[1]["id"]
     assert [proposal["agent_name"] for proposal in proposals] == [
-        "split_file.src.pkg.large.1a5de906",
-        "split_file.src.pkg.shared.a534170a",
-        "split_file.tests.large.56df040d",
+        "split_file.src.pkg.large.@",
+        "split_file.src.pkg.shared.@",
+        "split_file.tests.large.@",
     ]
-    assert all("@" not in proposal["agent_name"] for proposal in proposals)
+    assert all(
+        proposal["agent_name"].endswith(".@") and proposal["agent_name"].count("@") == 1
+        for proposal in proposals
+    )
     assert all(proposal["clan"] == "toobig-@" for proposal in proposals)
     assert {proposal["clan_summary"] for proposal in proposals} == {proposals[0]["clan_summary"]}
     summary_plain = Text.from_markup(proposals[0]["clan_summary"]).plain
@@ -322,6 +325,33 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "--files-only src 1000 850 700",
         "--files-only tests 1000 850 700",
+    ]
+
+
+def test_scan_agent_name_keeps_full_safe_dotted_module_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+) -> None:
+    repo = _prepare_repo(tmp_path)
+    long_path = "src/pkg/section_abcdefghijklmnopqrstuvwxyz0123456789/trailing_module.py"
+    (repo / long_path).parent.mkdir(parents=True, exist_ok=True)
+    (repo / long_path).write_text("value = 1\n", encoding="utf-8")
+    scanner = _fake_toobig(tmp_path)
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", f"{long_path}\n")
+
+    result = run_chop_main(
+        main,
+        tmp_path,
+        monkeypatch,
+        target=_target(repo),
+        variables={"toobig": str(scanner)},
+    )
+
+    assert result["status"] == "ok"
+    assert [proposal["agent_name"] for proposal in result["proposed_launches"]] == [
+        "split_file.src.pkg.section_abcdefghijklmnopqrstuvwxyz0123456789.trailing_module.@"
     ]
 
 
@@ -355,6 +385,11 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
 
     plans = plan_chop_proposals(prepared)
     assert [plan.clan for plan in plans] == ["toobig-0"] * 3
+    assert [plan.agent_name for plan in plans] == [
+        "toobig-0.split_file.src.pkg.large.0",
+        "toobig-0.split_file.src.pkg.shared.0",
+        "toobig-0.split_file.tests.large.0",
+    ]
     assert [plan.declares_clan for plan in plans] == [True, False, False]
     assert [plan.clan_summary for plan in plans] == [authored_summary, None, None]
     assert sum(plan.prompt.count("%clan(") for plan in plans) == 1
@@ -372,6 +407,10 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
 
     accepted_tail = [replace(prepared[1], wait_on=None), *prepared[2:]]
     tail_plans = plan_chop_proposals(accepted_tail)
+    assert [plan.agent_name for plan in tail_plans] == [
+        "toobig-0.split_file.src.pkg.shared.0",
+        "toobig-0.split_file.tests.large.0",
+    ]
     assert [plan.declares_clan for plan in tail_plans] == [True, False]
     assert [plan.clan_summary for plan in tail_plans] == [authored_summary, None]
     assert extract_prompt_directives(tail_plans[0].prompt)[1].clan_summary == authored_summary
