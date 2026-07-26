@@ -101,6 +101,7 @@ responsibilities now belong to Axe:
 axe:
   lumberjacks:
     maintenance:
+      description: Minute lane that proposes split-file maintenance for oversized Python files
       interval: 60
       chops:
         toobig_split:
@@ -135,10 +136,12 @@ only after the proposed audit agent completes successfully.
 axe:
   lumberjacks:
     audits:
+      description: Five-minute lane that audits recent commits when repository drift crosses thresholds
       interval: 300
       chops:
         recent_bug_audit:
           script: bugyi_chop_recent_bug_audit
+          description: Audit recent commits for confirmed correctness bugs
           run_every: 1h
           trigger:
             git.commits_since:
@@ -151,6 +154,7 @@ axe:
 
         recent_improvement_audit:
           script: bugyi_chop_recent_improvement_audit
+          description: Audit recent commits for clear objective improvements
           run_every: 1h
           trigger:
             git.commits_since:
