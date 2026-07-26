@@ -101,12 +101,25 @@ responsibilities now belong to Axe:
 axe:
   lumberjacks:
     maintenance:
-      description: Minute lane that proposes split-file maintenance for oversized Python files
+      description: |-
+        Propose split-file maintenance for oversized Python files once a minute
+
+        Runs every 60 seconds so the chop can notice when its hourly `run_every` window opens. Use this lane for
+        low-cost maintenance proposals guarded by AXE, not for commit-threshold audits.
+
+        The `toobig-` clan inhibit guard prevents a new split-file scan while an earlier split swarm is still active.
       interval: 60
       chops:
         toobig_split:
           script: bugyi_chop_toobig_split
-          description: Split oversized Python files in sase
+          description: |-
+            Split oversized Python files in sase
+
+            Runs `bugyi_chop_toobig_split` once per hour for the `sase` target and scans the configured `src` and
+            `tests` trees with the `1000`, `850`, and `700` line limits.
+
+            Each actionable scan emits content-deduped `%auto #split_file:<path>` proposals in a sequential `toobig-`
+            clan, so one oversized file is handled before the next claim starts.
           run_every: 60m
           inhibit_if:
             agent_clan: {name_prefix: toobig-}
@@ -136,12 +149,26 @@ only after the proposed audit agent completes successfully.
 axe:
   lumberjacks:
     audits:
-      description: Five-minute lane that audits recent commits when repository drift crosses thresholds
+      description: |-
+        Audit recent commits when repository drift crosses thresholds
+
+        Runs every five minutes so the `git.commits_since` trigger, not the chop script, decides whether enough commits
+        have accumulated. Keep recent-commit review chops here; maintenance scans belong in their own lane.
+
+        `checkpoint: on_action_success` advances the trigger only after the proposed audit agent completes
+        successfully, so failed reviews do not hide uninspected commits.
       interval: 300
       chops:
         recent_bug_audit:
           script: bugyi_chop_recent_bug_audit
-          description: Audit recent commits for confirmed correctness bugs
+          description: |-
+            Audit recent commits for confirmed correctness bugs
+
+            Checks the `sase` target no more than once per hour and proposes work only after 200 commits have landed
+            since the last successful action.
+
+            The generated audit agent inspects the recent scope for correctness regressions and fixes only confirmed
+            bugs. Its stable `audit_bugs.*` name lets AXE dedupe repeated proposals for the same project and revision.
           run_every: 1h
           trigger:
             git.commits_since:
@@ -154,7 +181,15 @@ axe:
 
         recent_improvement_audit:
           script: bugyi_chop_recent_improvement_audit
-          description: Audit recent commits for clear objective improvements
+          description: |-
+            Audit recent commits for clear objective improvements
+
+            Checks the `sase` target no more than once per hour and proposes work only after 200 commits have landed
+            since the last successful action.
+
+            The generated audit agent looks for narrow, objective wins and leaves the tree untouched when the value is
+            speculative. Its stable `audit_improvements.*` name lets AXE dedupe repeated proposals for the same
+            project and revision.
           run_every: 1h
           trigger:
             git.commits_since:
