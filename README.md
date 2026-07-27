@@ -1,11 +1,12 @@
 # bugyi-chops
 
 `bugyi-chops` is Bryan Bugyi's community [SASE](https://sase.sh/) plugin for
-scheduled Axe jobs that need to propose coding-agent work. It supplies three console
+scheduled Axe jobs that need to propose coding-agent work. It supplies four console
 scripts:
 
 | Script | What it proposes |
 | --- | --- |
+| `bugyi_chop_ci_watch` | Idle-gated CI repairs and explicitly enabled, guarded release merges |
 | `bugyi_chop_toobig_split` | One `%auto #split_file:<path>` agent per oversized Python file, chained in scan order |
 | `bugyi_chop_recent_bug_audit` | One recent-commit audit for confirmed correctness bugs |
 | `bugyi_chop_recent_improvement_audit` | One recent-commit audit for narrow, objective improvements |
@@ -14,6 +15,13 @@ The scripts never launch agents themselves. They scan or assemble a prompt, then
 the public `sase.chops` SDK to atomically write a validated result document. Axe owns
 guard and trigger evaluation, deduplication, workspace allocation, proposal launches,
 and the final action lifecycle.
+
+`bugyi_chop_ci_watch` additionally owns a tightly guarded direct side effect: when
+`vars.merge_enabled` is true and `SASE_CHOP_DRY_RUN=0` is explicitly present, it may
+squash-merge one fully green release-please or release-plz PR. Missing or true dry-run
+context always suppresses merging. Its CI-fix proposals are emitted only after a
+global `sase agent list -j` probe reports zero live agents; the small race between that
+probe and Axe launching the proposal is accepted.
 
 ## Installation
 
