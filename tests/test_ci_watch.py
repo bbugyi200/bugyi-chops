@@ -18,6 +18,7 @@ from bugyi_chops.ci_watch import (
     CommandResult,
     Config,
     GitHubReader,
+    HeadCiEvidence,
     MergePlan,
     ReleasePr,
     RepoObservation,
@@ -25,6 +26,7 @@ from bugyi_chops.ci_watch import (
     actionably_red,
     build_ci_watch_result,
     classify_repo,
+    decide_repo,
     plan_release_merge,
     run_command,
 )
@@ -42,6 +44,7 @@ def _commit(
     *,
     run_conclusion: str | None = None,
     failed_job: bool = False,
+    failed_job_name: str = "test token=do-not-leak",
 ) -> dict[str, Any]:
     run: dict[str, Any] = {
         "conclusion": run_conclusion or conclusion,
@@ -51,7 +54,7 @@ def _commit(
     if failed_job:
         run["jobs"] = [
             {
-                "name": "test token=do-not-leak",
+                "name": failed_job_name,
                 "conclusion": "failure",
                 "steps": [{"name": "Run tests", "conclusion": "failure"}],
             }
@@ -64,6 +67,24 @@ def _commit(
         "conclusion": conclusion,
         "runs": [run],
     }
+
+
+def _head_evidence(
+    sha: str,
+    *,
+    in_flight: bool = False,
+    green: bool = False,
+    failing_jobs: Sequence[str] = (),
+    successful_jobs: Sequence[str] = (),
+) -> HeadCiEvidence:
+    return HeadCiEvidence(
+        sha=sha,
+        has_in_flight=in_flight,
+        all_completed_green=green,
+        failing_jobs=tuple(failing_jobs),
+        successful_jobs=tuple(successful_jobs),
+        run_url=f"https://github.com/{REPO}/actions/runs/99" if failing_jobs else None,
+    )
 
 
 def _observations(
@@ -131,6 +152,9 @@ class FakeGitHub:
             CORE: BranchHead("master", CORE_SHA),
         }
         self.in_flight: set[str] = set()
+        self.workflow_counts: dict[str, int | Exception] = {REPO: 1, CORE: 1}
+        self.head_evidence: dict[str, HeadCiEvidence | Exception] = {}
+        self.head_evidence_calls: list[tuple[str, str]] = []
         self.numbers: dict[str, list[int]] = {REPO: [], CORE: []}
         self.prs: dict[tuple[str, int], list[ReleasePr]] = {}
         self.busy: set[str] = set()
@@ -146,6 +170,19 @@ class FakeGitHub:
     def has_in_flight_runs(self, repo: str, branch: str) -> bool:
         assert branch == "master"
         return repo in self.in_flight
+
+    def workflow_count(self, repo: str) -> int:
+        value = self.workflow_counts[repo]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def head_ci_evidence(self, repo: str, sha: str) -> HeadCiEvidence:
+        self.head_evidence_calls.append((repo, sha))
+        value = self.head_evidence[repo]
+        if isinstance(value, Exception):
+            raise value
+        return value
 
     def generator_busy(self, repo: str, branch: str, generator: str) -> bool:
         assert branch == "master"
@@ -198,6 +235,7 @@ def _vars(
     merge_enabled: bool = False,
     max_fixes: int = 1,
     max_merges: int = 1,
+    red_debounce_ticks: int = 1,
 ) -> dict[str, Any]:
     return {
         "actstat_bin": "/fake/actstat",
@@ -208,6 +246,7 @@ def _vars(
         "merge_order": list(merge_order),
         "max_fix_proposals_per_tick": max_fixes,
         "max_merges_per_tick": max_merges,
+        "red_debounce_ticks": red_debounce_ticks,
         "fix_enabled": fix_enabled,
         "merge_enabled": merge_enabled,
     }
@@ -257,12 +296,14 @@ def test_all_green_without_release_prs_is_noop(tmp_path: Path) -> None:
     assert result["counters"] == {
         "repos": 2,
         "green": 2,
+        "no_ci": 0,
         "red": 0,
         "pending": 0,
         "errors": 0,
         "agents_running": 0,
         "fix_proposed": 0,
         "fix_suppressed": 0,
+        "red_debounce_suppressed": 0,
         "release_candidates": 0,
         "merged": 0,
         "merge_skipped": 0,
@@ -275,9 +316,10 @@ def test_all_green_without_release_prs_is_noop(tmp_path: Path) -> None:
 
 def test_red_idle_emits_one_pinned_sanitized_proposal(tmp_path: Path) -> None:
     agents = FakeAgents(notify_ok=False)
+    observations = _observations(red=(REPO,), active=(REPO,))
     result, ledger, _, agents = _build(
         tmp_path,
-        _observations(red=(REPO,)),
+        observations,
         agents=agents,
     )
 
@@ -286,7 +328,8 @@ def test_red_idle_emits_one_pinned_sanitized_proposal(tmp_path: Path) -> None:
     proposal = result["proposed_launches"][0]
     assert proposal["workspace"] == f"gh:{REPO}"
     assert proposal["agent_name"] == "ci_fix.sase"
-    assert proposal["dedupe_key"] == f"ci_fix:{REPO}:{SHA}"
+    assert proposal["dedupe_key"] == ledger["repositories"][REPO]["proposal"]["dedupe_key"]
+    assert SHA not in proposal["dedupe_key"]
     assert "#pr(ci_fix_sase_aaaaaaa, status=ready)" in proposal["prompt"]
     assert f"#actstat(repo={REPO})" in proposal["prompt"]
     assert SHA in proposal["prompt"]
@@ -344,8 +387,8 @@ def test_fix_disabled_does_not_probe_agents(tmp_path: Path) -> None:
         (
             RepoObservation(REPO, active={"sha": "a" * 7}, commit=_commit(REPO, SHA)),
             None,
-            "pending",
-            "run_in_flight",
+            "green",
+            "green",
         ),
         (
             RepoObservation(
@@ -371,13 +414,13 @@ def test_fix_disabled_does_not_probe_agents(tmp_path: Path) -> None:
             RepoObservation(REPO, commit=_commit(REPO, SHA)),
             "new_head",
             "pending",
-            "newer_head_or_run_in_flight",
+            "newer_head_unsettled",
         ),
         (
             RepoObservation(REPO, commit=_commit(REPO, SHA)),
             "in_flight",
-            "pending",
-            "newer_head_or_run_in_flight",
+            "green",
+            "green",
         ),
         (
             RepoObservation(REPO, commit=_commit(REPO, SHA)),
@@ -409,6 +452,273 @@ def test_pending_and_error_classification_is_fail_closed(
     assert result["counters"][counter_name] >= 1
     assert ledger["repositories"][REPO]["reason"] == expected_reason
     assert all(item["workspace"] != f"gh:{REPO}" for item in result["proposed_launches"])
+
+
+def test_older_red_stays_actionable_while_head_is_unsettled(tmp_path: Path) -> None:
+    new_head = "c" * 40
+    github = FakeGitHub()
+    github.heads[REPO] = BranchHead("master", new_head)
+    github.head_evidence[REPO] = _head_evidence(new_head, in_flight=True)
+
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,), active=(REPO,)),
+        github=github,
+    )
+
+    assert result["counters"]["red"] == 1
+    proposal = result["proposed_launches"][0]
+    assert f"Pinned failing commit: {SHA[:7]}" in proposal["prompt"]
+    assert new_head in proposal["prompt"]
+    assert "older than the current unsettled HEAD" in proposal["prompt"]
+    assert ledger["repositories"][REPO]["classification_reason"] == "head_unsettled"
+    assert ledger["repositories"][REPO]["head_unsettled"] is True
+
+
+def test_newer_head_red_evidence_takes_precedence(tmp_path: Path) -> None:
+    new_head = "c" * 40
+    github = FakeGitHub()
+    github.heads[REPO] = BranchHead("master", new_head)
+    github.head_evidence[REPO] = _head_evidence(
+        new_head,
+        failing_jobs=("new failing job",),
+    )
+
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        github=github,
+    )
+
+    proposal = result["proposed_launches"][0]
+    assert f"Pinned failing commit: {new_head}" in proposal["prompt"]
+    assert "new failing job" in proposal["prompt"]
+    assert ledger["repositories"][REPO]["failing_jobs"] == ["new failing job"]
+
+
+def test_newer_success_supersedes_same_failing_job(tmp_path: Path) -> None:
+    new_head = "c" * 40
+    github = FakeGitHub()
+    github.heads[REPO] = BranchHead("master", new_head)
+    github.head_evidence[REPO] = _head_evidence(
+        new_head,
+        in_flight=True,
+        successful_jobs=("test [redacted]",),
+    )
+
+    result, ledger, _, agents = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        github=github,
+    )
+
+    assert result["counters"]["green"] == 2
+    assert result["proposed_launches"] == []
+    assert agents.probes == 0
+    assert ledger["repositories"][REPO]["reason"] == "superseded_by_newer_success"
+
+
+def test_supersession_query_failure_is_isolated_to_repo(tmp_path: Path) -> None:
+    new_head = "c" * 40
+    github = FakeGitHub()
+    github.heads[REPO] = BranchHead("master", new_head)
+    github.head_evidence[REPO] = CiWatchError("HEAD query failed")
+
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        github=github,
+    )
+
+    assert result["counters"]["errors"] == 1
+    assert result["counters"]["green"] == 1
+    assert ledger["repositories"][REPO]["reason"] == "HEAD query failed"
+
+
+def test_head_evidence_queries_have_a_per_tick_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "bugyi_chops.ci_watch.MAX_HEAD_EVIDENCE_REPOS_PER_TICK",
+        0,
+    )
+    github = FakeGitHub()
+    github.heads[REPO] = BranchHead("master", "c" * 40)
+
+    result, ledger, github, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        github=github,
+    )
+
+    assert result["counters"]["errors"] == 1
+    assert ledger["repositories"][REPO]["reason"] == "HEAD evidence per-tick query limit reached"
+    assert github.head_evidence_calls == []
+
+
+def test_pure_terminal_decision_fail_closed_and_fallback_matrix() -> None:
+    head = BranchHead("master", "c" * 40)
+    assert decide_repo(RepoObservation(REPO, error="forbidden"), head).state is RepoState.ERROR
+
+    red_without_jobs = RepoObservation(
+        REPO,
+        commit=_commit(REPO, SHA, "failure", run_conclusion="failure"),
+    )
+    decision = decide_repo(red_without_jobs, BranchHead("master", SHA))
+    assert (decision.state, decision.reason) == (
+        RepoState.ERROR,
+        "red_evidence_missing_job_identity",
+    )
+
+    older_red = RepoObservation(
+        REPO,
+        commit=_commit(REPO, SHA, "failure", failed_job=True),
+    )
+    decision = decide_repo(older_red, head)
+    assert (decision.state, decision.reason) == (
+        RepoState.ERROR,
+        "missing_head_ci_evidence",
+    )
+
+    decision = decide_repo(
+        older_red,
+        head,
+        head_evidence=_head_evidence(head.sha, green=True),
+    )
+    assert (decision.state, decision.reason) == (RepoState.GREEN, "green")
+
+    decision = decide_repo(
+        older_red,
+        head,
+        head_evidence=_head_evidence(head.sha),
+    )
+    assert (decision.state, decision.reason) == (
+        RepoState.PENDING,
+        "superseded_or_unsettled",
+    )
+
+    pending = RepoObservation(REPO, commit=_commit(REPO, SHA, "cancelled"))
+    decision = decide_repo(pending, BranchHead("master", SHA))
+    assert (decision.state, decision.reason) == (
+        RepoState.PENDING,
+        "superseded_or_unsettled",
+    )
+
+
+def test_red_debounce_persists_and_resets_on_changed_fingerprint(
+    tmp_path: Path,
+) -> None:
+    variables = _vars(red_debounce_ticks=2)
+    first, first_ledger, _, first_agents = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        variables=variables,
+    )
+    second, second_ledger, _, second_agents = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        variables=variables,
+    )
+
+    assert first["proposed_launches"] == []
+    assert first["counters"]["red_debounce_suppressed"] == 1
+    assert first_ledger["repositories"][REPO]["reason"] == "red_debounce"
+    assert first_agents.probes == 0
+    assert len(second["proposed_launches"]) == 1
+    assert second_ledger["repositories"][REPO]["streak"] == 2
+    assert second_agents.probes == 1
+
+    changed_path = tmp_path / "changed"
+    _build(
+        changed_path,
+        _observations(red=(REPO,)),
+        variables=variables,
+    )
+    changed = _observations(red=(REPO,))
+    changed[REPO] = RepoObservation(
+        REPO,
+        commit=_commit(
+            REPO,
+            SHA,
+            "failure",
+            failed_job=True,
+            failed_job_name="different job",
+        ),
+    )
+    changed_result, changed_ledger, _, _ = _build(
+        changed_path,
+        changed,
+        variables=variables,
+    )
+    assert changed_result["proposed_launches"] == []
+    assert changed_ledger["repositories"][REPO]["streak"] == 1
+
+
+def test_intervening_green_and_corrupt_streak_reset_debounce(tmp_path: Path) -> None:
+    variables = _vars(red_debounce_ticks=2)
+    _build(tmp_path, _observations(red=(REPO,)), variables=variables)
+    _build(tmp_path, _observations(), variables=variables)
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        variables=variables,
+    )
+    assert result["proposed_launches"] == []
+    assert ledger["repositories"][REPO]["streak"] == 1
+
+    (tmp_path / "ci_watch_red_streaks.json").write_text("{broken", encoding="utf-8")
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        variables=variables,
+    )
+    assert result["proposed_launches"] == []
+    assert ledger["repositories"][REPO]["streak"] == 1
+
+
+def test_dedupe_key_is_stable_across_head_shas(tmp_path: Path) -> None:
+    first, _, _, _ = _build(tmp_path, _observations(red=(REPO,)))
+    new_sha = "c" * 40
+    observations = _observations()
+    observations[REPO] = RepoObservation(
+        REPO,
+        commit=_commit(REPO, new_sha, "failure", failed_job=True),
+    )
+    github = FakeGitHub()
+    github.heads[REPO] = BranchHead("master", new_sha)
+    second, _, _, _ = _build(tmp_path, observations, github=github)
+
+    assert (
+        first["proposed_launches"][0]["dedupe_key"] == second["proposed_launches"][0]["dedupe_key"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("workflow_count", "expected_state", "expected_reason"),
+    [
+        (0, "no_ci", "no_ci"),
+        (1, "error", "missing_observation"),
+        (CiWatchError("probe failed"), "error", "missing_observation"),
+    ],
+)
+def test_missing_observation_distinguishes_no_ci(
+    tmp_path: Path,
+    workflow_count: int | Exception,
+    expected_state: str,
+    expected_reason: str,
+) -> None:
+    github = FakeGitHub()
+    github.workflow_counts[REPO] = workflow_count
+    observations = _observations()
+    observations[REPO] = RepoObservation(REPO, error="missing_observation")
+
+    result, ledger, _, _ = _build(tmp_path, observations, github=github)
+
+    counter = "errors" if expected_state == "error" else expected_state
+    assert result["counters"][counter] == 1
+    assert ledger["repositories"][REPO]["state"] == expected_state
+    assert ledger["repositories"][REPO]["reason"] == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -747,6 +1057,201 @@ def test_github_reader_covers_queries_and_mutation_argv() -> None:
         "--match-head-commit",
         SHA,
     ]
+
+
+def test_github_reader_probes_workflows_and_bounded_head_job_evidence() -> None:
+    runs = {
+        "total_count": 3,
+        "workflow_runs": [
+            {"id": 3, "status": "in_progress", "conclusion": None},
+            {
+                "id": 2,
+                "status": "completed",
+                "conclusion": "failure",
+                "html_url": f"https://github.com/{REPO}/actions/runs/2",
+            },
+            {"id": 1, "status": "completed", "conclusion": "success"},
+        ],
+    }
+    failed_jobs = {
+        "total_count": 2,
+        "jobs": [
+            {"name": "lint", "status": "completed", "conclusion": "failure"},
+            {"name": "still running", "status": "in_progress", "conclusion": None},
+        ],
+    }
+    successful_jobs = {
+        "total_count": 1,
+        "jobs": [{"name": "test", "status": "completed", "conclusion": "success"}],
+    }
+    runner = QueueRunner(
+        CommandResult(0, '{"total_count":2}'),
+        CommandResult(0, json.dumps(runs)),
+        CommandResult(0, json.dumps(failed_jobs)),
+        CommandResult(0, json.dumps(successful_jobs)),
+    )
+    github = GitHubReader("/gh", runner)
+
+    assert github.workflow_count(REPO) == 2
+    assert github.head_ci_evidence(REPO, SHA) == HeadCiEvidence(
+        sha=SHA,
+        has_in_flight=True,
+        all_completed_green=False,
+        failing_jobs=("lint",),
+        successful_jobs=("test",),
+        run_url=f"https://github.com/{REPO}/actions/runs/2",
+    )
+    assert runner.calls[0][0] == [
+        "/gh",
+        "api",
+        "-X",
+        "GET",
+        f"repos/{REPO}/actions/workflows",
+        "-f",
+        "per_page=1",
+    ]
+    assert f"head_sha={SHA}" in runner.calls[1][0]
+    assert runner.calls[2][0][-3:] == [
+        f"repos/{REPO}/actions/runs/2/jobs",
+        "-f",
+        "per_page=100",
+    ]
+
+
+def test_github_reader_head_evidence_recognizes_all_green_and_latest_job_result() -> None:
+    runs = {
+        "total_count": 1,
+        "workflow_runs": [{"id": 2, "status": "completed", "conclusion": "success"}],
+    }
+    jobs = {
+        "total_count": 1,
+        "jobs": [{"name": "test", "status": "completed", "conclusion": "success"}],
+    }
+    github = GitHubReader(
+        "gh",
+        QueueRunner(
+            CommandResult(0, json.dumps(runs)),
+            CommandResult(0, json.dumps(jobs)),
+        ),
+    )
+    evidence = github.head_ci_evidence(REPO, SHA)
+    assert evidence.all_completed_green is True
+    assert evidence.successful_jobs == ("test",)
+    assert evidence.failing_jobs == ()
+
+    retry_runs = {
+        "total_count": 2,
+        "workflow_runs": [
+            {"id": 2, "status": "completed", "conclusion": "success"},
+            {"id": 1, "status": "completed", "conclusion": "failure"},
+        ],
+    }
+    success = {
+        "total_count": 1,
+        "jobs": [{"name": "test", "status": "completed", "conclusion": "success"}],
+    }
+    failure = {
+        "total_count": 1,
+        "jobs": [{"name": "test", "status": "completed", "conclusion": "failure"}],
+    }
+    github = GitHubReader(
+        "gh",
+        QueueRunner(
+            CommandResult(0, json.dumps(retry_runs)),
+            CommandResult(0, json.dumps(success)),
+            CommandResult(0, json.dumps(failure)),
+        ),
+    )
+    evidence = github.head_ci_evidence(REPO, SHA)
+    assert evidence.failing_jobs == ()
+    assert evidence.successful_jobs == ("test",)
+
+
+@pytest.mark.parametrize(
+    ("payloads", "message"),
+    [
+        (['{"total_count":"zero"}'], "invalid total_count"),
+        (["[]"], "workflows are not an object"),
+    ],
+)
+def test_github_reader_rejects_invalid_workflow_probe(
+    payloads: list[str],
+    message: str,
+) -> None:
+    github = GitHubReader("gh", QueueRunner(*(CommandResult(0, raw) for raw in payloads)))
+    with pytest.raises(CiWatchError, match=message):
+        github.workflow_count(REPO)
+
+
+@pytest.mark.parametrize(
+    ("runs", "jobs", "message"),
+    [
+        ({"workflow_runs": [], "total_count": 21}, None, "bounded query limit"),
+        ({"workflow_runs": [1], "total_count": 1}, None, "invalid collection"),
+        (
+            {"workflow_runs": [{"status": "mystery"}], "total_count": 1},
+            None,
+            "invalid status",
+        ),
+        (
+            {
+                "workflow_runs": [{"id": 1, "status": "completed", "conclusion": None}],
+                "total_count": 1,
+            },
+            None,
+            "invalid conclusion",
+        ),
+        (
+            {
+                "workflow_runs": [{"id": 0, "status": "completed", "conclusion": "success"}],
+                "total_count": 1,
+            },
+            None,
+            "invalid id",
+        ),
+        (
+            {
+                "workflow_runs": [{"id": 1, "status": "completed", "conclusion": "success"}],
+                "total_count": 1,
+            },
+            {"jobs": [{"name": 1}], "total_count": 1},
+            "invalid fields",
+        ),
+        (
+            {
+                "workflow_runs": [{"id": 1, "status": "completed", "conclusion": "success"}],
+                "total_count": 1,
+            },
+            {
+                "jobs": [{"name": "test", "status": "completed", "conclusion": None}],
+                "total_count": 1,
+            },
+            "invalid conclusion",
+        ),
+        (
+            {
+                "workflow_runs": [{"id": 1, "status": "completed", "conclusion": "failure"}],
+                "total_count": 1,
+            },
+            {
+                "jobs": [{"name": "test", "status": "completed", "conclusion": "success"}],
+                "total_count": 1,
+            },
+            "no failing job identity",
+        ),
+    ],
+)
+def test_github_reader_head_evidence_fails_closed_on_bounded_shapes(
+    runs: dict[str, Any],
+    jobs: dict[str, Any] | None,
+    message: str,
+) -> None:
+    results = [CommandResult(0, json.dumps(runs))]
+    if jobs is not None:
+        results.append(CommandResult(0, json.dumps(jobs)))
+    github = GitHubReader("gh", QueueRunner(*results))
+    with pytest.raises(CiWatchError, match=message):
+        github.head_ci_evidence(REPO, SHA)
 
 
 @pytest.mark.parametrize(

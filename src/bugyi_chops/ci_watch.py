@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -34,7 +35,11 @@ TOKEN_PATTERN = re.compile(
 )
 MAX_REPOS = 50
 MAX_LEDGER_NAMES = 10
+MAX_HEAD_RUNS = 20
+MAX_HEAD_JOBS = 100
+MAX_HEAD_EVIDENCE_REPOS_PER_TICK = 10
 MAX_TEXT = 240
+STREAK_FILE_NAME = "ci_watch_red_streaks.json"
 
 type JsonObject = dict[str, Any]
 
@@ -45,6 +50,7 @@ class CiWatchError(RuntimeError):
 
 class RepoState(StrEnum):
     ERROR = "error"
+    NO_CI = "no_ci"
     PENDING = "pending"
     RED = "red"
     GREEN = "green"
@@ -238,8 +244,6 @@ def actionably_red(commit: Mapping[str, Any]) -> bool:
 def classify_repo(observation: RepoObservation) -> RepoState:
     if observation.error or observation.commit is None:
         return RepoState.ERROR
-    if observation.active is not None:
-        return RepoState.PENDING
     if actionably_red(observation.commit):
         return RepoState.RED
     conclusion = str(observation.commit.get("conclusion", "")).lower()
@@ -249,8 +253,6 @@ def classify_repo(observation: RepoObservation) -> RepoState:
 def _classification_reason(observation: RepoObservation, state: RepoState) -> str:
     if state is RepoState.ERROR:
         return observation.error or "missing_commit"
-    if observation.active is not None:
-        return "run_in_flight"
     if state is RepoState.RED:
         return "actionable_failure"
     if state is RepoState.GREEN:
@@ -262,6 +264,146 @@ def _classification_reason(observation: RepoObservation, state: RepoState) -> st
 class BranchHead:
     branch: str
     sha: str
+
+
+@dataclass(frozen=True)
+class HeadCiEvidence:
+    sha: str
+    has_in_flight: bool
+    all_completed_green: bool
+    failing_jobs: tuple[str, ...]
+    successful_jobs: tuple[str, ...]
+    run_url: str | None = None
+
+
+@dataclass(frozen=True)
+class FailureEvidence:
+    sha: str
+    failing_jobs: tuple[str, ...]
+    run_url: str | None
+    head_unsettled: bool = False
+    current_head_sha: str | None = None
+
+    @property
+    def fingerprint(self) -> tuple[str, ...]:
+        return self.failing_jobs
+
+    @property
+    def fingerprint_key(self) -> str:
+        payload = "\0".join(self.fingerprint).encode()
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class RepoDecision:
+    state: RepoState
+    reason: str
+    head: BranchHead | None = None
+    failure: FailureEvidence | None = None
+
+
+def _failed_job_names(commit: Mapping[str, Any]) -> tuple[str, ...]:
+    names: set[str] = set()
+    runs = commit.get("runs")
+    if not isinstance(runs, list):
+        return ()
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        jobs = run.get("jobs")
+        if not isinstance(jobs, list):
+            continue
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            conclusion = str(job.get("conclusion", "")).lower()
+            if conclusion not in RED_CONCLUSIONS:
+                continue
+            name = job.get("name")
+            if isinstance(name, str) and name.strip():
+                names.add(_bounded(name, limit=100))
+    return tuple(sorted(names))
+
+
+def _failure_run_url(commit: Mapping[str, Any]) -> str | None:
+    runs = commit.get("runs")
+    if not isinstance(runs, list):
+        return None
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        url = run.get("url")
+        if isinstance(url, str) and url.startswith("https://github.com/"):
+            return url[:MAX_TEXT]
+    return None
+
+
+def decide_repo(
+    observation: RepoObservation,
+    head: BranchHead,
+    *,
+    head_evidence: HeadCiEvidence | None = None,
+) -> RepoDecision:
+    """Classify one observed repository from terminal CI evidence."""
+    base_state = classify_repo(observation)
+    if base_state is RepoState.ERROR:
+        return RepoDecision(base_state, _classification_reason(observation, base_state))
+    if observation.commit is None:
+        return RepoDecision(RepoState.ERROR, "missing_commit")
+    settled_sha = _commit_sha(observation)
+    current = head.sha.startswith(settled_sha)
+    if base_state is RepoState.RED:
+        settled_jobs = _failed_job_names(observation.commit)
+        if not settled_jobs:
+            return RepoDecision(RepoState.ERROR, "red_evidence_missing_job_identity")
+        if current:
+            return RepoDecision(
+                RepoState.RED,
+                "actionable_failure",
+                head,
+                FailureEvidence(
+                    head.sha,
+                    settled_jobs,
+                    _failure_run_url(observation.commit),
+                ),
+            )
+        if head_evidence is None or head_evidence.sha != head.sha:
+            return RepoDecision(RepoState.ERROR, "missing_head_ci_evidence")
+        if head_evidence.failing_jobs:
+            return RepoDecision(
+                RepoState.RED,
+                "actionable_failure",
+                head,
+                FailureEvidence(
+                    head.sha,
+                    head_evidence.failing_jobs,
+                    head_evidence.run_url,
+                ),
+            )
+        remaining = tuple(sorted(set(settled_jobs).difference(head_evidence.successful_jobs)))
+        if not remaining:
+            return RepoDecision(RepoState.GREEN, "superseded_by_newer_success", head)
+        if head_evidence.all_completed_green:
+            return RepoDecision(RepoState.GREEN, "green", head)
+        if head_evidence.has_in_flight:
+            return RepoDecision(
+                RepoState.RED,
+                "head_unsettled",
+                head,
+                FailureEvidence(
+                    settled_sha,
+                    remaining,
+                    _failure_run_url(observation.commit),
+                    head_unsettled=True,
+                    current_head_sha=head.sha,
+                ),
+            )
+        return RepoDecision(RepoState.PENDING, "superseded_or_unsettled")
+    if base_state is RepoState.GREEN:
+        if current:
+            return RepoDecision(RepoState.GREEN, "green", head)
+        return RepoDecision(RepoState.PENDING, "newer_head_unsettled")
+    return RepoDecision(RepoState.PENDING, "superseded_or_unsettled")
 
 
 @dataclass(frozen=True)
@@ -382,6 +524,129 @@ class GitHubReader:
             raise CiWatchError(f"{repo} default branch head is not an object")
         return BranchHead(branch, _sha(commit.get("sha")))
 
+    def workflow_count(self, repo: str) -> int:
+        repo = _repo(repo)
+        data = self._json(
+            [
+                "api",
+                "-X",
+                "GET",
+                f"repos/{repo}/actions/workflows",
+                "-f",
+                "per_page=1",
+            ],
+            source=f"{repo} workflows",
+        )
+        if not isinstance(data, dict):
+            raise CiWatchError(f"{repo} workflows are not an object")
+        count = data.get("total_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise CiWatchError(f"{repo} workflows have an invalid total_count")
+        return count
+
+    def head_ci_evidence(self, repo: str, sha: str) -> HeadCiEvidence:
+        repo = _repo(repo)
+        sha = _sha(sha)
+        data = self._json(
+            [
+                "api",
+                "-X",
+                "GET",
+                f"repos/{repo}/actions/runs",
+                "-f",
+                f"head_sha={sha}",
+                "-f",
+                f"per_page={MAX_HEAD_RUNS}",
+            ],
+            source=f"{repo} HEAD workflow runs",
+        )
+        runs = self._bounded_collection(
+            repo,
+            data,
+            collection_key="workflow_runs",
+            limit=MAX_HEAD_RUNS,
+            source="HEAD workflow runs",
+        )
+        has_in_flight = False
+        all_completed_green = bool(runs)
+        latest_job_conclusions: dict[str, str] = {}
+        red_run_url: str | None = None
+        terminal_red_without_job = False
+        for run in runs:
+            status = run.get("status")
+            if not isinstance(status, str) or status.lower() not in KNOWN_RUN_STATUSES:
+                raise CiWatchError(f"{repo} HEAD workflow runs contain an invalid status")
+            normalized_status = status.lower()
+            if normalized_status in IN_FLIGHT_STATUSES:
+                has_in_flight = True
+                all_completed_green = False
+                continue
+            conclusion = run.get("conclusion")
+            if not isinstance(conclusion, str):
+                raise CiWatchError(f"{repo} HEAD workflow runs contain an invalid conclusion")
+            normalized_conclusion = conclusion.lower()
+            if normalized_conclusion not in GREEN_CONCLUSIONS:
+                all_completed_green = False
+            run_id = run.get("id")
+            if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+                raise CiWatchError(f"{repo} HEAD workflow run has an invalid id")
+            jobs = self._run_jobs(repo, run_id)
+            run_has_red_job = False
+            for job in jobs:
+                job_status = job.get("status")
+                conclusion_value = job.get("conclusion")
+                name = job.get("name")
+                if (
+                    not isinstance(job_status, str)
+                    or job_status.lower() not in KNOWN_RUN_STATUSES
+                    or not isinstance(name, str)
+                    or not name.strip()
+                ):
+                    raise CiWatchError(f"{repo} HEAD jobs contain invalid fields")
+                if job_status.lower() != "completed":
+                    continue
+                if not isinstance(conclusion_value, str):
+                    raise CiWatchError(f"{repo} HEAD jobs contain an invalid conclusion")
+                bounded_name = _bounded(name, limit=100)
+                normalized_job_conclusion = conclusion_value.lower()
+                latest_job_conclusions.setdefault(bounded_name, normalized_job_conclusion)
+                if normalized_job_conclusion in RED_CONCLUSIONS:
+                    run_has_red_job = True
+            if normalized_conclusion in RED_CONCLUSIONS or (
+                normalized_conclusion == "cancelled" and run_has_red_job
+            ):
+                terminal_red_without_job = terminal_red_without_job or not run_has_red_job
+                if red_run_url is None:
+                    candidate_url = run.get("html_url")
+                    if isinstance(candidate_url, str) and candidate_url.startswith(
+                        "https://github.com/"
+                    ):
+                        red_run_url = candidate_url[:MAX_TEXT]
+        failing_jobs = tuple(
+            sorted(
+                name
+                for name, conclusion in latest_job_conclusions.items()
+                if conclusion in RED_CONCLUSIONS
+            )
+        )
+        if terminal_red_without_job and not failing_jobs:
+            raise CiWatchError(f"{repo} HEAD red evidence has no failing job identity")
+        successful_jobs = tuple(
+            sorted(
+                name
+                for name, conclusion in latest_job_conclusions.items()
+                if conclusion == "success"
+            )
+        )
+        return HeadCiEvidence(
+            sha=sha,
+            has_in_flight=has_in_flight,
+            all_completed_green=all_completed_green,
+            failing_jobs=failing_jobs,
+            successful_jobs=successful_jobs,
+            run_url=red_run_url,
+        )
+
     def has_in_flight_runs(self, repo: str, branch: str) -> bool:
         data = self._workflow_runs(repo, branch)
         return any(str(run.get("status", "")).lower() in IN_FLIGHT_STATUSES for run in data)
@@ -402,6 +667,50 @@ class GitHubReader:
             if any(needle in label for needle in needles):
                 return True
         return False
+
+    def _bounded_collection(
+        self,
+        repo: str,
+        data: object,
+        *,
+        collection_key: str,
+        limit: int,
+        source: str,
+    ) -> list[JsonObject]:
+        if not isinstance(data, dict) or not isinstance(data.get(collection_key), list):
+            raise CiWatchError(f"{repo} {source} have an invalid shape")
+        total_count = data.get("total_count")
+        if (
+            not isinstance(total_count, int)
+            or isinstance(total_count, bool)
+            or total_count < 0
+            or total_count > limit
+        ):
+            raise CiWatchError(f"{repo} {source} exceed the bounded query limit")
+        values = data[collection_key]
+        if len(values) != total_count or not all(isinstance(value, dict) for value in values):
+            raise CiWatchError(f"{repo} {source} contain an invalid collection")
+        return cast(list[JsonObject], values)
+
+    def _run_jobs(self, repo: str, run_id: int) -> list[JsonObject]:
+        data = self._json(
+            [
+                "api",
+                "-X",
+                "GET",
+                f"repos/{repo}/actions/runs/{run_id}/jobs",
+                "-f",
+                f"per_page={MAX_HEAD_JOBS}",
+            ],
+            source=f"{repo} run {run_id} jobs",
+        )
+        return self._bounded_collection(
+            repo,
+            data,
+            collection_key="jobs",
+            limit=MAX_HEAD_JOBS,
+            source=f"run {run_id} jobs",
+        )
 
     def _workflow_runs(self, repo: str, branch: str) -> list[JsonObject]:
         repo = _repo(repo)
@@ -550,6 +859,7 @@ class Config:
     merge_order: tuple[str, ...]
     max_merges: int
     max_fixes: int
+    red_debounce_ticks: int
     fix_enabled: bool
     merge_enabled: bool
 
@@ -586,6 +896,7 @@ class Config:
             merge_order=merge_order,
             max_merges=_positive_int(values, "max_merges_per_tick", 1),
             max_fixes=_positive_int(values, "max_fix_proposals_per_tick", 1),
+            red_debounce_ticks=_positive_int(values, "red_debounce_ticks", 2),
             fix_enabled=_bool(values, "fix_enabled", True),
             merge_enabled=_bool(values, "merge_enabled", False),
         )
@@ -638,51 +949,17 @@ def _commit_sha(observation: RepoObservation) -> str:
     return _sha(observation.commit.get("sha"))
 
 
-def _failed_details(commit: Mapping[str, Any]) -> tuple[str | None, list[str]]:
-    url: str | None = None
-    names: list[str] = []
-    runs = commit.get("runs")
-    if not isinstance(runs, list):
-        return None, names
-    for run in runs:
-        if not isinstance(run, dict):
-            continue
-        run_conclusion = str(run.get("conclusion", "")).lower()
-        if run_conclusion not in RED_CONCLUSIONS | {"cancelled"}:
-            continue
-        candidate_url = run.get("url")
-        if (
-            url is None
-            and isinstance(candidate_url, str)
-            and candidate_url.startswith("https://github.com/")
-        ):
-            url = candidate_url[:MAX_TEXT]
-        jobs = run.get("jobs")
-        if not isinstance(jobs, list):
-            continue
-        for job in jobs:
-            if not isinstance(job, dict):
-                continue
-            if str(job.get("conclusion", "")).lower() == "failure":
-                names.append(_bounded(job.get("name", "failed job"), limit=100))
-            steps = job.get("steps")
-            if isinstance(steps, list):
-                names.extend(
-                    _bounded(step.get("name", "failed step"), limit=100)
-                    for step in steps
-                    if isinstance(step, dict)
-                    and str(step.get("conclusion", "")).lower() == "failure"
-                )
-            if len(names) >= 8:
-                return url, names[:8]
-    return url, names[:8]
-
-
-def _fix_prompt(repo: str, sha: str, commit: Mapping[str, Any]) -> str:
+def _fix_prompt(repo: str, failure: FailureEvidence) -> str:
     slug = safe_fragment(repo.rsplit("/", 1)[-1])
-    pr_name = f"ci_fix_{slug.replace('-', '_')}_{sha[:7]}"
-    run_url, failures = _failed_details(commit)
-    evidence = "\n".join(f"- {name}" for name in failures) or "- See the pinned run."
+    pr_name = f"ci_fix_{slug.replace('-', '_')}_{failure.sha[:7]}"
+    evidence = "\n".join(f"- {name}" for name in failure.failing_jobs)
+    unsettled_note = ""
+    if failure.head_unsettled:
+        unsettled_note = f"""
+The pinned failure is on a settled commit older than the current unsettled HEAD
+({failure.current_head_sha}). Re-verify these job failures against current state
+before changing code.
+"""
     return f"""\
 #pr({pr_name}, status=ready)
 
@@ -690,10 +967,11 @@ def _fix_prompt(repo: str, sha: str, commit: Mapping[str, Any]) -> str:
 
 Repair the current default-branch CI failure in {repo}.
 
-Pinned failing run: {run_url or "unavailable"}
-Pinned default-branch commit: {sha}
-Failed jobs or steps from the sweep:
+Pinned failing run: {failure.run_url or "unavailable"}
+Pinned failing commit: {failure.sha}
+Failed jobs from the sweep:
 {evidence}
+{unsettled_note}
 
 First re-verify that this failure and commit are still current on the default branch.
 If it was superseded or already fixed, leave the worktree unchanged and report that
@@ -714,27 +992,26 @@ def _new_counters(repo_count: int) -> dict[str, int]:
     return {
         "repos": repo_count,
         "green": 0,
+        "no_ci": 0,
         "red": 0,
         "pending": 0,
         "errors": 0,
         "agents_running": 0,
         "fix_proposed": 0,
         "fix_suppressed": 0,
+        "red_debounce_suppressed": 0,
         "release_candidates": 0,
         "merged": 0,
         "merge_skipped": 0,
     }
 
 
-def _write_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> str:
-    result_dir = Path(invocation.context.result_file).resolve().parent
-    result_dir.mkdir(parents=True, exist_ok=True)
-    evidence_name = "ci_watch_decisions.json"
-    destination = result_dir / evidence_name
-    fd, temporary = tempfile.mkstemp(prefix=".ci-watch-", dir=result_dir)
+def _atomic_write_json(destination: Path, value: Mapping[str, Any]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".ci-watch-", dir=destination.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(ledger, stream, sort_keys=True, separators=(",", ":"))
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -743,6 +1020,58 @@ def _write_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> str:
         with suppress(FileNotFoundError):
             os.unlink(temporary)
         raise
+
+
+def _load_streaks(invocation: ChopInvocation) -> dict[str, tuple[tuple[str, ...], int]]:
+    path = Path(invocation.context.state_dir) / STREAK_FILE_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return {}
+    repos = raw.get("repositories")
+    if not isinstance(repos, dict):
+        return {}
+    streaks: dict[str, tuple[tuple[str, ...], int]] = {}
+    for repo, row in repos.items():
+        if not isinstance(repo, str) or not isinstance(row, dict):
+            continue
+        fingerprint = row.get("fingerprint")
+        streak = row.get("streak")
+        if (
+            not isinstance(fingerprint, list)
+            or not fingerprint
+            or not all(isinstance(name, str) and name for name in fingerprint)
+            or not isinstance(streak, int)
+            or isinstance(streak, bool)
+            or streak < 1
+        ):
+            continue
+        streaks[repo] = (tuple(sorted(set(fingerprint))), streak)
+    return streaks
+
+
+def _write_streaks(
+    invocation: ChopInvocation,
+    streaks: Mapping[str, tuple[tuple[str, ...], int]],
+) -> None:
+    destination = Path(invocation.context.state_dir) / STREAK_FILE_NAME
+    payload: JsonObject = {
+        "version": 1,
+        "repositories": {
+            repo: {"fingerprint": list(fingerprint), "streak": streak}
+            for repo, (fingerprint, streak) in sorted(streaks.items())
+        },
+    }
+    _atomic_write_json(destination, payload)
+
+
+def _write_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> str:
+    result_dir = Path(invocation.context.result_file).resolve().parent
+    evidence_name = "ci_watch_decisions.json"
+    destination = result_dir / evidence_name
+    _atomic_write_json(destination, ledger)
     return evidence_name
 
 
@@ -779,25 +1108,53 @@ def build_ci_watch_result(
     counters = _new_counters(len(config.repos))
     states: dict[str, RepoState] = {}
     heads: dict[str, BranchHead] = {}
+    failures: dict[str, FailureEvidence] = {}
     ledger_repos: dict[str, JsonObject] = {}
+    head_evidence_repos = 0
 
     for repo in config.repos:
         observation = observations[repo]
-        state = classify_repo(observation)
-        reason = _classification_reason(observation, state)
-        if state in {RepoState.RED, RepoState.GREEN}:
+        decision: RepoDecision
+        if observation.error == "missing_observation":
+            try:
+                if github.workflow_count(repo) == 0:
+                    decision = RepoDecision(RepoState.NO_CI, "no_ci")
+                else:
+                    decision = RepoDecision(RepoState.ERROR, "missing_observation")
+            except CiWatchError as error:
+                decision = RepoDecision(
+                    RepoState.ERROR,
+                    "missing_observation",
+                )
+                _mark(ledger_repos, repo, workflow_probe_error=str(error))
+        elif observation.error or observation.commit is None:
+            state = classify_repo(observation)
+            decision = RepoDecision(state, _classification_reason(observation, state))
+        else:
             try:
                 head = github.default_branch_head(repo)
-                settled_sha = _commit_sha(observation)
-                if not head.sha.startswith(settled_sha) or github.has_in_flight_runs(
-                    repo, head.branch
+                head_evidence = None
+                if classify_repo(observation) is RepoState.RED and not head.sha.startswith(
+                    _commit_sha(observation)
                 ):
-                    state, reason = RepoState.PENDING, "newer_head_or_run_in_flight"
-                else:
-                    heads[repo] = head
+                    if head_evidence_repos >= MAX_HEAD_EVIDENCE_REPOS_PER_TICK:
+                        raise CiWatchError("HEAD evidence per-tick query limit reached")
+                    head_evidence_repos += 1
+                    head_evidence = github.head_ci_evidence(repo, head.sha)
+                decision = decide_repo(
+                    observation,
+                    head,
+                    head_evidence=head_evidence,
+                )
             except CiWatchError as error:
-                state, reason = RepoState.ERROR, str(error)
+                decision = RepoDecision(RepoState.ERROR, str(error))
+        state = decision.state
+        reason = decision.reason
         states[repo] = state
+        if decision.head is not None:
+            heads[repo] = decision.head
+        if decision.failure is not None:
+            failures[repo] = decision.failure
         counter_name = "errors" if state is RepoState.ERROR else state.value
         counters[counter_name] += 1
         _mark(
@@ -805,13 +1162,43 @@ def build_ci_watch_result(
             repo,
             state=state,
             reason=reason,
+            classification_reason=reason,
             head_sha=heads[repo].sha if repo in heads else None,
+            failing_sha=decision.failure.sha if decision.failure is not None else None,
+            head_unsettled=(
+                decision.failure.head_unsettled if decision.failure is not None else None
+            ),
         )
 
-    red_repos = [repo for repo in config.repos if states[repo] is RepoState.RED]
-    if red_repos:
+    streaks = _load_streaks(invocation)
+    mature_red_repos: list[str] = []
+    for repo in config.repos:
+        if states[repo] is not RepoState.RED:
+            streaks.pop(repo, None)
+            continue
+        failure = failures[repo]
+        previous = streaks.get(repo)
+        streak = (
+            previous[1] + 1 if previous is not None and previous[0] == failure.fingerprint else 1
+        )
+        streaks[repo] = (failure.fingerprint, streak)
+        _mark(
+            ledger_repos,
+            repo,
+            streak=streak,
+            failing_jobs=list(failure.failing_jobs),
+            failing_job_fingerprint=failure.fingerprint_key,
+        )
+        if streak < config.red_debounce_ticks:
+            counters["fix_suppressed"] += 1
+            counters["red_debounce_suppressed"] += 1
+            _mark(ledger_repos, repo, reason="red_debounce")
+            continue
+        mature_red_repos.append(repo)
+
+    if mature_red_repos:
         if not config.fix_enabled:
-            for repo in red_repos:
+            for repo in mature_red_repos:
                 counters["fix_suppressed"] += 1
                 _mark(ledger_repos, repo, reason="fix_disabled")
         else:
@@ -819,14 +1206,14 @@ def build_ci_watch_result(
                 probe = agents.probe()
             except CiWatchError:
                 probe = None
-                for repo in red_repos:
+                for repo in mature_red_repos:
                     counters["fix_suppressed"] += 1
                     _mark(ledger_repos, repo, reason="agents_check_failed")
             if probe is not None:
                 counters["agents_running"] = probe.count
                 if probe.count:
                     busy_names = list(probe.names[:MAX_LEDGER_NAMES])
-                    for repo in red_repos:
+                    for repo in mature_red_repos:
                         counters["fix_suppressed"] += 1
                         _mark(
                             ledger_repos,
@@ -835,29 +1222,31 @@ def build_ci_watch_result(
                             busy_agents=busy_names,
                         )
                 else:
-                    for index, repo in enumerate(red_repos):
+                    for index, repo in enumerate(mature_red_repos):
                         if index >= config.max_fixes:
                             counters["fix_suppressed"] += 1
                             _mark(ledger_repos, repo, reason="fix_cap_reached")
                             continue
-                        observation = observations[repo]
-                        head = heads[repo]
-                        if observation.commit is None:
-                            raise CiWatchError(f"{repo} lost its settled commit")
+                        failure = failures[repo]
                         slug = safe_fragment(repo.rsplit("/", 1)[-1])
-                        result_prompt = _fix_prompt(repo, head.sha, observation.commit)
+                        dedupe_key = f"ci_fix:{repo}:{failure.fingerprint_key}"
+                        result_prompt = _fix_prompt(repo, failure)
                         counters["fix_proposed"] += 1
                         _mark(ledger_repos, repo, reason="fix_proposed")
                         if not agents.notify(
-                            f"Proposed a CI repair for {repo} at {head.sha[:7]}", "ci"
+                            f"Proposed a CI repair for {repo} at {failure.sha[:7]}", "ci"
                         ):
                             ledger_repos[repo]["notification"] = "failed"
                         ledger_repos[repo]["proposal"] = {
                             "agent_name": f"ci_fix.{slug}",
-                            "dedupe_key": f"ci_fix:{repo}:{head.sha}",
+                            "dedupe_key": dedupe_key,
                         }
                         # Proposals are appended after the summary builder exists below.
                         ledger_repos[repo]["_prompt"] = result_prompt
+                        ledger_repos[repo]["_dedupe_key"] = dedupe_key
+                        streaks.pop(repo, None)
+
+    _write_streaks(invocation, streaks)
 
     release_plans: list[MergePlan] = []
     for repo in config.merge_order:
@@ -962,17 +1351,17 @@ def build_ci_watch_result(
         status="ok" if actionable else "no_op",
         reason=None if actionable else "no_actions",
     )
-    for repo in red_repos:
+    for repo in mature_red_repos:
         prompt = ledger_repos[repo].pop("_prompt", None)
-        if isinstance(prompt, str):
-            head = heads[repo]
+        dedupe_key = ledger_repos[repo].pop("_dedupe_key", None)
+        if isinstance(prompt, str) and isinstance(dedupe_key, str):
             slug = safe_fragment(repo.rsplit("/", 1)[-1])
             result.propose(
                 prompt,
                 f"gh:{repo}",
                 proposal_id=f"fix_{slug}",
                 agent_name=f"ci_fix.{slug}",
-                dedupe_key=f"ci_fix:{repo}:{head.sha}",
+                dedupe_key=dedupe_key,
             )
     ledger = {
         "mode": mode,
@@ -993,6 +1382,12 @@ def build_ci_watch_result(
 def main() -> None:
     run_chop(
         CHOP_NAME,
-        "Sweep SASE CI, propose idle-gated repairs, and guard release merges",
+        """\
+Sweep SASE CI, propose idle-gated repairs, and guard release merges.
+
+Terminal failing-job evidence stays actionable while unrelated work is in flight.
+A fixer landing either changes the failing job set or turns the repository green;
+either outcome resets the debounce streak and releases its SHA-independent key.
+""".strip(),
         build_ci_watch_result,
     )
