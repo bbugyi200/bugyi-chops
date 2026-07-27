@@ -1068,9 +1068,9 @@ def _write_streaks(
 
 
 def _write_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> str:
-    result_dir = Path(invocation.context.result_file).resolve().parent
-    evidence_name = "ci_watch_decisions.json"
-    destination = result_dir / evidence_name
+    result_path = Path(invocation.context.result_file).resolve()
+    evidence_name = f"{result_path.stem}.decisions.json"
+    destination = result_path.parent / evidence_name
     _atomic_write_json(destination, ledger)
     return evidence_name
 
@@ -1343,7 +1343,7 @@ def build_ci_watch_result(
         if not agents.notify(f"Merged release PR #{plan.pr.number} for {repo}", "release"):
             ledger_repos[repo]["notification"] = "failed"
 
-    actionable = bool(counters["fix_proposed"] or counters["merged"] or release_plans)
+    actionable = bool(counters["fix_proposed"] or counters["merged"])
     result = result_with_summary(
         invocation,
         CHOP_NAME,

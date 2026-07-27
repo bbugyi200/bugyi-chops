@@ -252,7 +252,12 @@ def _vars(
     }
 
 
-def _invocation(tmp_path: Path, variables: dict[str, Any]) -> ChopInvocation:
+def _invocation(
+    tmp_path: Path,
+    variables: dict[str, Any],
+    *,
+    result_file: str = "result.json",
+) -> ChopInvocation:
     context = ChopScriptContext(
         max_hook_runners=1,
         max_agent_runners=1,
@@ -262,7 +267,7 @@ def _invocation(tmp_path: Path, variables: dict[str, Any]) -> ChopInvocation:
         state_dir=str(tmp_path),
         all_changespecs_file=str(tmp_path / "all.json"),
         filtered_changespecs_file=str(tmp_path / "filtered.json"),
-        result_file=str(tmp_path / "result.json"),
+        result_file=str(tmp_path / result_file),
         vars=variables,
     )
     return ChopInvocation(ChopArguments("context.json", False), context, ChopLogger())
@@ -275,16 +280,21 @@ def _build(
     github: FakeGitHub | None = None,
     agents: FakeAgents | None = None,
     variables: dict[str, Any] | None = None,
+    result_file: str = "result.json",
 ) -> tuple[dict[str, Any], dict[str, Any], FakeGitHub, FakeAgents]:
     github = github or FakeGitHub()
     agents = agents or FakeAgents()
     result = build_ci_watch_result(
-        _invocation(tmp_path, variables or _vars()),
+        _invocation(tmp_path, variables or _vars(), result_file=result_file),
         actstat=FakeActstat(observations),  # type: ignore[arg-type]
         github=github,  # type: ignore[arg-type]
         agents=agents,  # type: ignore[arg-type]
     ).to_dict()
-    ledger = json.loads((tmp_path / "ci_watch_decisions.json").read_text())
+    evidence = result["evidence"]
+    assert isinstance(evidence, list)
+    assert len(evidence) == 1
+    assert isinstance(evidence[0], str)
+    ledger = json.loads((tmp_path / evidence[0]).read_text())
     return result, ledger, github, agents
 
 
@@ -309,9 +319,29 @@ def test_all_green_without_release_prs_is_noop(tmp_path: Path) -> None:
         "merge_skipped": 0,
     }
     assert result["proposed_launches"] == []
-    assert result["evidence"] == ["ci_watch_decisions.json"]
+    assert result["evidence"] == ["result.decisions.json"]
     assert ledger["repositories"][REPO]["reason"] == "green"
     assert agents.probes == 0
+
+
+def test_ledger_file_is_unique_per_result_file(tmp_path: Path) -> None:
+    first_result, first_ledger, _, _ = _build(
+        tmp_path,
+        _observations(),
+        result_file="tick-one.json",
+    )
+    second_result, second_ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(CORE,)),
+        result_file="tick-two.json",
+    )
+
+    assert first_result["evidence"] == ["tick-one.decisions.json"]
+    assert second_result["evidence"] == ["tick-two.decisions.json"]
+    assert (tmp_path / "tick-one.decisions.json").is_file()
+    assert (tmp_path / "tick-two.decisions.json").is_file()
+    assert first_ledger["repositories"][CORE]["reason"] == "green"
+    assert second_ledger["repositories"][CORE]["reason"] == "fix_proposed"
 
 
 def test_red_idle_emits_one_pinned_sanitized_proposal(tmp_path: Path) -> None:
@@ -815,7 +845,8 @@ def test_merge_modes_render_without_mutation(
             merge_enabled=merge_enabled,
         ),
     )
-    assert result["status"] == "ok"
+    assert result["status"] == "no_op"
+    assert result["reason"] == "no_actions"
     assert result["counters"]["release_candidates"] == 1
     assert result["counters"]["merge_skipped"] == 1
     assert result["counters"]["merged"] == 0
