@@ -10,6 +10,7 @@ from sase.axe.chop_script_context import ChopScriptContext
 from sase.chops import ChopArguments, ChopInvocation, ChopLogger
 
 from bugyi_chops.ci_watch import (
+    MAX_LEDGER_NAMES,
     ActstatClient,
     AgentProbe,
     AgentsGate,
@@ -370,32 +371,87 @@ def test_red_idle_emits_one_pinned_sanitized_proposal(tmp_path: Path) -> None:
     assert "token=" not in json.dumps(ledger).lower()
 
 
-def test_red_repos_are_globally_gated_and_capped(tmp_path: Path) -> None:
+def test_unrelated_agents_do_not_block_fixes_and_proposals_are_capped(
+    tmp_path: Path,
+) -> None:
     observations = _observations(red=(REPO, CORE))
-    busy_result, busy_ledger, _, _ = _build(
-        tmp_path / "busy",
+    result, ledger, _, _ = _build(
+        tmp_path,
         observations,
-        agents=FakeAgents(["one", "two"]),
+        agents=FakeAgents(["interactive", "toobig-worker", "audit.waiting"]),
     )
-    assert busy_result["counters"]["agents_running"] == 2
-    assert busy_result["counters"]["fix_suppressed"] == 2
-    assert busy_result["proposed_launches"] == []
-    assert busy_ledger["repositories"][CORE]["reason"] == "agents_busy"
-    assert busy_ledger["repositories"][CORE]["busy_agents"] == ["one", "two"]
 
-    failed_result, failed_ledger, _, _ = _build(
-        tmp_path / "failed",
-        observations,
+    assert result["counters"]["agents_running"] == 3
+    assert result["counters"]["fix_proposed"] == 1
+    assert result["counters"]["fix_suppressed"] == 1
+    assert [item["workspace"] for item in result["proposed_launches"]] == [f"gh:{REPO}"]
+    assert ledger["repositories"][REPO]["reason"] == "fix_proposed"
+    assert ledger["repositories"][CORE]["reason"] == "fix_cap_reached"
+
+
+def test_live_ci_fix_agent_suppresses_all_mature_red_repos(tmp_path: Path) -> None:
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO, CORE)),
+        agents=FakeAgents(["interactive", "ci_fix.sase"]),
+    )
+
+    assert result["counters"]["agents_running"] == 2
+    assert result["counters"]["fix_suppressed"] == 2
+    assert result["proposed_launches"] == []
+    assert ledger["repositories"][REPO]["reason"] == "fix_in_flight"
+    assert ledger["repositories"][CORE]["in_flight_agents"] == ["ci_fix.sase"]
+
+
+@pytest.mark.parametrize(
+    ("agent_names", "expected_reason"),
+    [
+        (("ci_fix",), "fix_in_flight"),
+        (("ci_fix.sase",), "fix_in_flight"),
+        (("ci_fix.sase.child",), "fix_in_flight"),
+        (("ci_fixer",), "fix_proposed"),
+        (("ci_fixing.sase",), "fix_proposed"),
+    ],
+)
+def test_ci_fix_hood_matching(
+    tmp_path: Path,
+    agent_names: tuple[str, ...],
+    expected_reason: str,
+) -> None:
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        agents=FakeAgents(agent_names),
+    )
+
+    assert ledger["repositories"][REPO]["reason"] == expected_reason
+    assert bool(result["proposed_launches"]) is (expected_reason == "fix_proposed")
+
+
+def test_ci_fix_ledger_names_are_bounded_and_redacted(tmp_path: Path) -> None:
+    secret_name = f"ci_fix.token=do-not-leak{'.x' * 100}"
+    _, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        agents=FakeAgents([secret_name] * (MAX_LEDGER_NAMES + 1)),
+    )
+
+    names = ledger["repositories"][REPO]["in_flight_agents"]
+    assert len(names) == MAX_LEDGER_NAMES
+    assert all(len(name) <= 100 for name in names)
+    assert "do-not-leak" not in json.dumps(names)
+
+
+def test_agent_probe_failure_suppresses_fixes(tmp_path: Path) -> None:
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO, CORE)),
         agents=FakeAgents(error=True),
     )
-    assert failed_result["counters"]["fix_suppressed"] == 2
-    assert failed_ledger["repositories"][REPO]["reason"] == "agents_check_failed"
 
-    capped_result, capped_ledger, _, _ = _build(tmp_path / "capped", observations)
-    assert capped_result["counters"]["fix_proposed"] == 1
-    assert capped_result["counters"]["fix_suppressed"] == 1
-    assert [item["workspace"] for item in capped_result["proposed_launches"]] == [f"gh:{REPO}"]
-    assert capped_ledger["repositories"][CORE]["reason"] == "fix_cap_reached"
+    assert result["counters"]["fix_suppressed"] == 2
+    assert result["proposed_launches"] == []
+    assert ledger["repositories"][REPO]["reason"] == "agents_check_failed"
 
 
 def test_fix_disabled_does_not_probe_agents(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-"""Watch SASE CI health, propose repairs, and merge guarded release PRs."""
+"""Watch SASE CI health, avoid overlapping repairs, and merge guarded release PRs."""
 
 from __future__ import annotations
 
@@ -1211,15 +1211,20 @@ def build_ci_watch_result(
                     _mark(ledger_repos, repo, reason="agents_check_failed")
             if probe is not None:
                 counters["agents_running"] = probe.count
-                if probe.count:
-                    busy_names = list(probe.names[:MAX_LEDGER_NAMES])
+                fix_agents = tuple(
+                    name for name in probe.names if name == "ci_fix" or name.startswith("ci_fix.")
+                )
+                if fix_agents:
+                    in_flight_names = [
+                        _bounded(name, limit=100) for name in fix_agents[:MAX_LEDGER_NAMES]
+                    ]
                     for repo in mature_red_repos:
                         counters["fix_suppressed"] += 1
                         _mark(
                             ledger_repos,
                             repo,
-                            reason="agents_busy",
-                            busy_agents=busy_names,
+                            reason="fix_in_flight",
+                            in_flight_agents=in_flight_names,
                         )
                 else:
                     for index, repo in enumerate(mature_red_repos):
@@ -1383,9 +1388,11 @@ def main() -> None:
     run_chop(
         CHOP_NAME,
         """\
-Sweep SASE CI, propose idle-gated repairs, and guard release merges.
+Sweep SASE CI, propose non-overlapping repairs, and guard release merges.
 
 Terminal failing-job evidence stays actionable while unrelated work is in flight.
+A repair proposal is suppressed only while a live agent exists in the `ci_fix`
+hood; lane-level `wait_runners` controls launch-time machine idleness.
 A fixer landing either changes the failing job set or turns the repository green;
 either outcome resets the debounce streak and releases its SHA-independent key.
 """.strip(),
