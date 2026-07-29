@@ -92,7 +92,8 @@ def build_audit_result(
     safe_project = safe_fragment(project)
     revision = safe_fragment(head_short or "current", fallback="current")
     pr_name = f"{kind.pr_prefix}_{safe_project.replace('.', '_')}_{revision}"
-    agent_name = f"{kind.agent_hood}.{safe_project}.{revision}"
+    # `@` lets SASE allocate a short alphanumeric suffix at launch.
+    agent_name = f"{kind.agent_hood}.{safe_project}.@"
 
     invocation.logger.debug(f"project={project} workspace={workspace} head={head or '-'}")
     result = result_with_summary(

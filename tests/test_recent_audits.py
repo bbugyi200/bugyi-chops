@@ -54,10 +54,11 @@ def test_bug_audit_ports_recent_commit_prompt_and_head_context(
     assert result["status"] == "ok"
     proposal = result["proposed_launches"][0]
     assert proposal["workspace"] == "gh:example/demo"
-    assert proposal["agent_name"] == f"audit_bugs.demo-project.{head[:12]}"
+    assert proposal["agent_name"] == "audit_bugs.demo-project.@"
+    assert head[:12] not in proposal["agent_name"]
     assert f"through {head}" in proposal["prompt"]
     assert "correctness regressions" in proposal["prompt"]
-    assert "#pr(recent_bug_audit_demo-project_" in proposal["prompt"]
+    assert f"#pr(recent_bug_audit_demo-project_{head[:12]})" in proposal["prompt"]
     assert "git.commits_since" in proposal["prompt"]
     assert "#!" not in proposal["prompt"]
 
@@ -76,7 +77,7 @@ def test_improvement_audit_uses_vars_and_current_head_fallback(
 
     proposal = result["proposed_launches"][0]
     assert proposal["workspace"] == "git:demo"
-    assert proposal["agent_name"] == "audit_improvements.demo_project.current"
+    assert proposal["agent_name"] == "audit_improvements.demo_project.@"
     assert "objective wins" in proposal["prompt"]
     assert "current HEAD" in proposal["prompt"]
     assert "#pr(recent_improvement_audit_demo_project_current)" in proposal["prompt"]

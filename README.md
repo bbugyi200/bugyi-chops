@@ -176,7 +176,8 @@ axe:
             since the last successful action.
 
             The generated audit agent inspects the recent scope for correctness regressions and fixes only confirmed
-            bugs. Its stable `audit_bugs.*` name lets AXE dedupe repeated proposals for the same project and revision.
+            bugs. It is named `audit_bugs.<project>.@`, so SASE assigns a short alphanumeric suffix at launch while
+            keeping the agent in the `audit_bugs` hood for hood-based inhibit guards.
           run_every: 1h
           trigger:
             git.commits_since:
@@ -196,8 +197,8 @@ axe:
             since the last successful action.
 
             The generated audit agent looks for narrow, objective wins and leaves the tree untouched when the value is
-            speculative. Its stable `audit_improvements.*` name lets AXE dedupe repeated proposals for the same
-            project and revision.
+            speculative. It is named `audit_improvements.<project>.@`, so SASE assigns a short alphanumeric suffix at
+            launch while keeping the agent in the `audit_improvements` hood for hood-based inhibit guards.
           run_every: 1h
           trigger:
             git.commits_since:
@@ -210,8 +211,9 @@ axe:
 ```
 
 Each prompt records the current HEAD when `target.workspace_dir` is available, uses a
-stable `audit_bugs.*` or `audit_improvements.*` agent name, and includes a project- and
-revision-specific `#pr(...)` rollover.
+`audit_bugs.<project>.@` or `audit_improvements.<project>.@` agent-name template that
+SASE resolves at launch, and includes a project- and revision-specific `#pr(...)`
+rollover.
 
 ## Debugging
 
