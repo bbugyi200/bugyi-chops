@@ -15,6 +15,7 @@ from bugyi_chops._common import (
     target_label,
     target_workspace_dir,
 )
+from bugyi_chops._report import start_report
 
 DEFAULT_WORKSPACE = "gh:sase-org/sase"
 
@@ -26,6 +27,9 @@ class AuditKind:
     pr_prefix: str
     subject: str
     instructions: str
+    report_title: str
+    scope_bullets: tuple[str, ...]
+    exclusion_bullets: tuple[str, ...]
 
 
 BUG_AUDIT = AuditKind(
@@ -33,6 +37,16 @@ BUG_AUDIT = AuditKind(
     agent_hood="audit_bugs",
     pr_prefix="recent_bug_audit",
     subject="confirmed bugs",
+    report_title="RECENT BUG AUDIT",
+    scope_bullets=(
+        "Correctness regressions and broken edge cases",
+        "Unsafe error handling, race conditions, and data-loss risks",
+        "Test failures introduced by the commits in scope",
+    ),
+    exclusion_bullets=(
+        "Unrelated improvements and style-only edits",
+        "Speculative refactors, broad rewrites, and preference changes",
+    ),
     instructions="""\
 Inspect the commits in scope for correctness regressions, broken edge cases, unsafe
 error handling, race conditions, data-loss risks, and test failures introduced by
@@ -49,6 +63,17 @@ IMPROVEMENT_AUDIT = AuditKind(
     agent_hood="audit_improvements",
     pr_prefix="recent_improvement_audit",
     subject="objective improvements",
+    report_title="RECENT IMPROVEMENT AUDIT",
+    scope_bullets=(
+        "Small correctness-preserving simplifications",
+        "Plainly better error paths and targeted test coverage",
+        "Obvious low-risk performance fixes",
+    ),
+    exclusion_bullets=(
+        "Style churn, preference changes, and formatting-only edits",
+        "Speculative refactors, broad rewrites, and renames",
+        "Subjective cleanup",
+    ),
     instructions="""\
 Inspect the commits in scope for clear, objective wins: a small
 correctness-preserving simplification, a plainly better error path, targeted test
@@ -96,10 +121,32 @@ def build_audit_result(
     agent_name = f"{kind.agent_hood}.{safe_project}.@"
 
     invocation.logger.debug(f"project={project} workspace={workspace} head={head or '-'}")
+    report = start_report(kind.report_title).headline(
+        f"{project}: audit recent commits for {kind.subject}",
+        tone="accent",
+    )
+    report.heading("SCOPE").kv(
+        {
+            "project": project,
+            "workspace": workspace,
+        }
+    )
+    report.kv(
+        {"head": head_short or "unknown"},
+        tone=None if head_short else "muted",
+    ).kv(
+        {
+            "pr": pr_name,
+            "agent": agent_name,
+        }
+    )
+    report.heading("LOOKING FOR").bullets(kind.scope_bullets, tone="info")
+    report.heading("OUT OF SCOPE").bullets(kind.exclusion_bullets, tone="muted")
     result = result_with_summary(
         invocation,
         kind.name,
         {"targets": 1, "proposals": 1},
+        report=report,
     )
     return result.propose(
         _prompt(kind, project, head, pr_name),

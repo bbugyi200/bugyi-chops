@@ -14,9 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from rich.cells import cell_len
 from rich.text import Text
-from sase.chops import ChopInvocation, ChopResultBuilder
+from sase.chops import ChopInvocation, ChopReport, ChopResultBuilder, Tone
 
 from bugyi_chops._common import (
     context_target,
@@ -26,6 +25,12 @@ from bugyi_chops._common import (
     result_with_summary,
     run_chop,
     safe_fragment,
+)
+from bugyi_chops._report import (
+    add_facts_footer,
+    elide_path,
+    severity_tone,
+    start_report,
 )
 
 CHOP_NAME = "toobig_split"
@@ -61,6 +66,15 @@ class ScanTarget:
 class FileEntry:
     path: str
     line_count: int | None
+
+
+@dataclass(frozen=True)
+class TargetRow:
+    path: str
+    line_count: int | None
+    severity: str
+    tone: Tone
+    glyph: str
 
 
 def _env(name: str) -> str | None:
@@ -326,25 +340,9 @@ def _classify(line_count: int | None, limits: tuple[int, int, int]) -> str:
 
 
 def _elide_path(path: str, max_cells: int) -> str:
-    if max_cells <= 0:
-        return ""
-    if cell_len(path) <= max_cells:
-        return path
+    """Compatibility wrapper for the package-wide path elision helper."""
 
-    prefix = "…/"
-    if max_cells <= cell_len(prefix):
-        return prefix[:max_cells]
-    for start, character in enumerate(path):
-        if character != "/":
-            continue
-        candidate = prefix + path[start + 1 :]
-        if cell_len(candidate) <= max_cells:
-            return candidate
-    for start in range(1, len(path) + 1):
-        candidate = prefix + path[start:].lstrip("/")
-        if cell_len(candidate) <= max_cells:
-            return candidate
-    return prefix
+    return elide_path(path, max_cells)
 
 
 def _severity_display(severity: str) -> tuple[str, str]:
@@ -355,6 +353,92 @@ def _severity_display(severity: str) -> tuple[str, str]:
     if severity == "fyi":
         return CLAN_SUMMARY_FYI_GLYPH, CLAN_SUMMARY_FYI_STYLE
     return CLAN_SUMMARY_NEUTRAL_GLYPH, CLAN_SUMMARY_NEUTRAL_STYLE
+
+
+def _target_rows(
+    entries: Sequence[FileEntry],
+    limits: tuple[int, int, int],
+    *,
+    max_rows: int = CLAN_SUMMARY_MAX_ROWS,
+) -> tuple[list[TargetRow], int]:
+    """Compute the ordered target ledger shared by both report projections."""
+
+    sorted_entries = sorted(
+        entries,
+        key=lambda entry: (
+            entry.line_count is None,
+            -entry.line_count if entry.line_count is not None else 0,
+            entry.path,
+        ),
+    )
+    displayed_entries = sorted_entries[: max(0, max_rows)]
+    rows: list[TargetRow] = []
+    for entry in displayed_entries:
+        severity = _classify(entry.line_count, limits)
+        glyph, _ = _severity_display(severity)
+        rows.append(
+            TargetRow(
+                path=entry.path,
+                line_count=entry.line_count,
+                severity=severity,
+                tone=severity_tone(severity),
+                glyph=glyph,
+            )
+        )
+    return rows, len(entries) - len(displayed_entries)
+
+
+def _facts(tree_count: int, limits: tuple[int, int, int]) -> dict[str, str]:
+    return {
+        "scan roots": str(tree_count),
+        "limits": " / ".join(f"{limit:,}" for limit in limits),
+        "queue mode": "sequential",
+    }
+
+
+def _build_report(
+    rows: Sequence[TargetRow],
+    overflow: int,
+    tree_count: int,
+    limits: tuple[int, int, int],
+) -> ChopReport:
+    report = start_report("TOOBIG SPLIT")
+    has_violation = any(row.severity == "violation" for row in rows)
+    report.headline(
+        f"{len(rows) + overflow} files over limits",
+        tone="error" if has_violation else "warn",
+    ).heading("TARGETS")
+    table = report.rows(columns=("LINES", "FILE"))
+    for row in rows:
+        table.row(
+            (
+                str(row.line_count) if row.line_count is not None else "?",
+                _elide_path(row.path, CLAN_SUMMARY_WIDTH - 12),
+            ),
+            tone=row.tone,
+            glyph=row.glyph,
+        )
+    if overflow:
+        report.text(f"…and {overflow} more", tone="muted")
+    if rows and rows[0].line_count is not None:
+        report.gauge(
+            _elide_path(rows[0].path, CLAN_SUMMARY_WIDTH - 12),
+            rows[0].line_count,
+            limits[0],
+            tone=rows[0].tone,
+        )
+    return add_facts_footer(report, _facts(tree_count, limits))
+
+
+def _build_noop_report(
+    tree_count: int,
+    limits: tuple[int, int, int],
+) -> ChopReport:
+    report = start_report("TOOBIG SPLIT").headline(
+        "Every scanned file is within limits",
+        tone="ok",
+    )
+    return add_facts_footer(report, _facts(tree_count, limits))
 
 
 def _render_clan_summary(
@@ -382,28 +466,15 @@ def _render_clan_summary(
         Text("TARGETS", style=CLAN_SUMMARY_SECTION_STYLE),
     ]
 
-    sorted_entries = sorted(
-        entries,
-        key=lambda entry: (
-            entry.line_count is None,
-            -entry.line_count if entry.line_count is not None else 0,
-            entry.path,
-        ),
-    )
-    displayed_entries = sorted_entries[: max(0, max_rows)]
-    count_strings = [
-        f"{entry.line_count:,}" if entry.line_count is not None else "?"
-        for entry in displayed_entries
-    ]
+    rows, overflow = _target_rows(entries, limits, max_rows=max_rows)
+    count_strings = [f"{row.line_count:,}" if row.line_count is not None else "?" for row in rows]
     count_width = max((len(count) for count in count_strings), default=1)
     path_cells = CLAN_SUMMARY_WIDTH - (2 + count_width + 2)
-    for entry, count_string in zip(displayed_entries, count_strings, strict=True):
-        severity = _classify(entry.line_count, limits)
-        glyph, style = _severity_display(severity)
-        path = _elide_path(entry.path, path_cells)
-        lines.append(Text(f"{glyph} {count_string:>{count_width}}  {path}", style=style))
+    for row, count_string in zip(rows, count_strings, strict=True):
+        _, style = _severity_display(row.severity)
+        path = _elide_path(row.path, path_cells)
+        lines.append(Text(f"{row.glyph} {count_string:>{count_width}}  {path}", style=style))
 
-    overflow = file_count - len(displayed_entries)
     if overflow:
         lines.append(Text(f"…and {overflow} more", style=CLAN_SUMMARY_FACTS_STYLE))
     lines.extend(
@@ -431,16 +502,19 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
             {"trees": len(trees), "files": 0, "proposals": 0},
             status="no_op",
             reason="no_files_over_limits",
+            report=_build_noop_report(len(trees), limits),
         )
 
+    entries = [
+        FileEntry(path=path, line_count=_line_count(target.repo_root / path)) for path in files
+    ]
+    rows, overflow = _target_rows(entries, limits)
     result = result_with_summary(
         invocation,
         CHOP_NAME,
         {"trees": len(trees), "files": len(files), "proposals": len(files)},
+        report=_build_report(rows, overflow, len(trees), limits),
     )
-    entries = [
-        FileEntry(path=path, line_count=_line_count(target.repo_root / path)) for path in files
-    ]
     clan_summary = _render_clan_summary(entries, len(trees), limits)
     prior_id: str | None = None
     for path in files:

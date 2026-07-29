@@ -12,6 +12,7 @@ from typing import Any
 
 from sase.chops import (
     ChopInvocation,
+    ChopReport,
     ChopResultBuilder,
     ChopResultStatus,
     emit_summary,
@@ -131,6 +132,7 @@ def result_with_summary(
     *,
     status: ChopResultStatus = "ok",
     reason: str | None = None,
+    report: ChopReport | Mapping[str, Any] | None = None,
 ) -> ChopResultBuilder:
     line = emit_summary(name, counters, reason=reason, logger=invocation.logger)
     return ChopResultBuilder(
@@ -138,6 +140,7 @@ def result_with_summary(
         summary=line,
         reason=reason,
         counters=dict(counters),
+        report=report,
     )
 
 
@@ -150,11 +153,16 @@ def run_chop(name: str, description: str, body: ChopBody) -> None:
     except Exception as error:
         invocation.logger.error(f"{name} check failed: {error}")
         invocation.logger.debug(traceback.format_exc().rstrip())
+        report = ChopReport(title=name.replace("_", " ").upper()).headline(
+            f"Check failed: {error}",
+            tone="error",
+        )
         result = result_with_summary(
             invocation,
             name,
             {"proposals": 0},
             status="check_error",
             reason="check_failed",
+            report=report,
         )
     result.write(context=invocation.context)

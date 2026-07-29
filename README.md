@@ -37,8 +37,8 @@ For development against the repository rather than PyPI:
 sase plugin install bugyi-chops -g
 ```
 
-All scripts require Python 3.12 or newer and `sase>=0.12,<0.13`. SASE 0.12 is the
-first release with clan-scoped chop proposals. The package also
+All scripts require Python 3.12 or newer and `sase>=0.13.2,<0.14`. SASE 0.13.2 is the
+first release with structured chop reports. The package also
 installs the `toobig` scanner used by `bugyi_chop_toobig_split`.
 
 ## The chop result contract

@@ -13,6 +13,7 @@ from rich.cells import cell_len
 from rich.style import Style
 from rich.text import Text
 from sase.axe.chop_proposals import plan_chop_proposals, prepare_chop_proposals
+from sase.core.axe_chop_facade import validate_chop_result
 from sase.xprompt.directives import extract_prompt_directives
 
 from bugyi_chops.toobig_split import (
@@ -322,6 +323,16 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert "tests/large.py" in summary_plain
     assert all(proposal["workspace"] == "gh:example/demo" for proposal in proposals)
     assert len({proposal["dedupe_key"] for proposal in proposals}) == 3
+    report_rows = next(block for block in result["report"]["blocks"] if block["kind"] == "rows")[
+        "rows"
+    ]
+    assert {row["cells"][1] for row in report_rows} == {
+        "src/pkg/large.py",
+        "src/pkg/shared.py",
+        "tests/large.py",
+    }
+    assert all(row["tone"] == "muted" and row["glyph"] == "·" for row in report_rows)
+    validate_chop_result(result)
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "--files-only src 1000 850 700",
         "--files-only tests 1000 850 700",
@@ -528,6 +539,13 @@ def test_no_oversized_files_is_a_typed_noop(
     assert result["status"] == "no_op"
     assert result["reason"] == "no_files_over_limits"
     assert result["proposed_launches"] == []
+    assert result["report"]["title"] == "TOOBIG SPLIT"
+    assert result["report"]["blocks"][0] == {
+        "kind": "headline",
+        "text": "Every scanned file is within limits",
+        "tone": "ok",
+    }
+    validate_chop_result(result)
 
 
 @pytest.mark.parametrize(
@@ -589,6 +607,8 @@ def test_scanner_failure_is_visible_as_check_error(
     )
     assert result["status"] == "check_error"
     assert result["counters"] == {"proposals": 0}
+    assert result["report"]["blocks"][0]["tone"] == "error"
+    validate_chop_result(result)
 
 
 def test_absolute_scanner_paths_are_normalized_and_missing_files_still_dedupe(

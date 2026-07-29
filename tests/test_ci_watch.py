@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 from sase.axe.chop_script_context import ChopScriptContext
 from sase.chops import ChopArguments, ChopInvocation, ChopLogger
+from sase.core.axe_chop_facade import validate_chop_result
 
 from bugyi_chops.ci_watch import (
     MAX_LEDGER_NAMES,
@@ -28,6 +29,7 @@ from bugyi_chops.ci_watch import (
     build_ci_watch_result,
     classify_repo,
     decide_repo,
+    main,
     plan_release_merge,
     run_command,
 )
@@ -323,6 +325,54 @@ def test_all_green_without_release_prs_is_noop(tmp_path: Path) -> None:
     assert result["evidence"] == ["result.decisions.json"]
     assert ledger["repositories"][REPO]["reason"] == "green"
     assert agents.probes == 0
+
+    validated = validate_chop_result(result)
+    assert validated["report"]["title"] == "CI WATCH"
+
+
+def test_ci_watch_report_rows_follow_repository_state(tmp_path: Path) -> None:
+    result, _, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+    )
+
+    report = result["report"]
+    repositories = next(
+        block
+        for block in report["blocks"]
+        if block["kind"] == "rows" and block["columns"][0] == "REPOSITORY"
+    )
+    rows = {row["cells"][0]: row for row in repositories["rows"]}
+    assert (rows[REPO]["cells"][1], rows[REPO]["tone"], rows[REPO]["glyph"]) == (
+        "red",
+        "error",
+        "▲",
+    )
+    assert (rows[CORE]["cells"][1], rows[CORE]["tone"], rows[CORE]["glyph"]) == (
+        "green",
+        "ok",
+        "✓",
+    )
+    assert "streak 1/1" in rows[REPO]["cells"][2]
+    validate_chop_result(result)
+
+
+def test_ci_watch_check_error_still_emits_valid_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+) -> None:
+    result = run_chop_main(
+        main,
+        tmp_path,
+        monkeypatch,
+        variables={"repos": []},
+    )
+
+    assert result["status"] == "check_error"
+    assert result["report"]["title"] == "CI WATCH"
+    assert result["report"]["blocks"][0]["tone"] == "error"
+    validate_chop_result(result)
 
 
 def test_ledger_file_is_unique_per_result_file(tmp_path: Path) -> None:

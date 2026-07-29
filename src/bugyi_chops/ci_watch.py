@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import quote
 
-from sase.chops import ChopInvocation, ChopResultBuilder
+from sase.chops import ChopInvocation, ChopReport, ChopResultBuilder, Tone
 
 from bugyi_chops._common import context_vars, result_with_summary, run_chop, safe_fragment
+from bugyi_chops._report import add_facts_footer, start_report
 
 CHOP_NAME = "ci_watch"
 RED_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure", "action_required"})
@@ -1093,6 +1094,137 @@ def _mark(
             row[key] = value
 
 
+def _repo_state_presentation(state: RepoState) -> tuple[Tone, str]:
+    return {
+        RepoState.GREEN: ("ok", "✓"),
+        RepoState.RED: ("error", "▲"),
+        RepoState.PENDING: ("warn", "◆"),
+        RepoState.ERROR: ("error", "!"),
+        RepoState.NO_CI: ("muted", "·"),
+    }[state]
+
+
+def _repo_evidence(
+    repo: str,
+    state: RepoState,
+    heads: Mapping[str, BranchHead],
+    failures: Mapping[str, FailureEvidence],
+    ledger_repos: Mapping[str, JsonObject],
+    *,
+    red_debounce_ticks: int,
+) -> str:
+    row = ledger_repos.get(repo, {})
+    reason = str(row.get("reason", ""))
+    if reason in {
+        "red_debounce",
+        "fix_in_flight",
+        "fix_cap_reached",
+        "fix_disabled",
+        "agents_check_failed",
+    }:
+        return reason
+    if state is RepoState.GREEN and repo in heads:
+        return heads[repo].sha[:12]
+    if state is RepoState.RED and repo in failures:
+        jobs = " · ".join(failures[repo].failing_jobs)
+        streak = row.get("streak")
+        streak_text = (
+            f"streak {streak}/{red_debounce_ticks}"
+            if isinstance(streak, int)
+            else f"streak ?/{red_debounce_ticks}"
+        )
+        return _bounded(f"{jobs} · {streak_text}", limit=512)
+    return _bounded(reason or state.value, limit=512)
+
+
+def _release_tone(reason: str) -> Tone:
+    if reason == "merged":
+        return "ok"
+    if reason in {"no_release_pr", "dry_run"}:
+        return "muted"
+    return "warn"
+
+
+def _build_ci_watch_report(
+    config: Config,
+    counters: Mapping[str, int],
+    states: Mapping[str, RepoState],
+    heads: Mapping[str, BranchHead],
+    failures: Mapping[str, FailureEvidence],
+    ledger_repos: Mapping[str, JsonObject],
+    release_plans: Sequence[MergePlan],
+    mode: str,
+) -> ChopReport:
+    report = start_report("CI WATCH")
+    headline = (
+        f"{counters['green']} green · {counters['red']} red · "
+        f"{counters['pending']} pending · {counters['errors']} error"
+    )
+    headline_tone: Tone = (
+        "error"
+        if counters["red"]
+        else "warn"
+        if counters["pending"] or counters["errors"]
+        else "ok"
+    )
+    report.headline(headline, tone=headline_tone).heading("REPOSITORIES")
+    repositories = report.rows(columns=("REPOSITORY", "STATE", "EVIDENCE"))
+    for repo in config.repos:
+        state = states[repo]
+        tone, glyph = _repo_state_presentation(state)
+        repositories.row(
+            (
+                repo,
+                state.value,
+                _repo_evidence(
+                    repo,
+                    state,
+                    heads,
+                    failures,
+                    ledger_repos,
+                    red_debounce_ticks=config.red_debounce_ticks,
+                ),
+            ),
+            tone=tone,
+            glyph=glyph,
+        )
+
+    if config.release_repositories:
+        plans = {plan.repo: plan for plan in release_plans}
+        report.heading("RELEASE")
+        releases = report.rows(columns=("REPOSITORY", "PR", "DECISION"))
+        release_order = [repo for repo in config.merge_order if repo in config.release_repositories]
+        release_order.extend(
+            repo for repo in config.release_repositories if repo not in release_order
+        )
+        for repo in release_order:
+            ledger_row = ledger_repos.get(repo, {})
+            reason = str(ledger_row.get("reason", states[repo].value))
+            pr_number = ledger_row.get("merged_pr") or ledger_row.get("planned_pr")
+            if pr_number is None and repo in plans:
+                pr_number = plans[repo].pr.number
+            releases.row(
+                (repo, f"#{pr_number}" if pr_number is not None else "-", reason),
+                tone=_release_tone(reason),
+            )
+
+    add_facts_footer(
+        report,
+        {"mode": mode.replace("_", " ")},
+        tone="neutral" if mode == "live" else "warn",
+    )
+    report.kv(
+        {
+            "agents running": str(counters["agents_running"]),
+            "fix cap": str(config.max_fixes),
+            "merge cap": str(config.max_merges),
+            "debounce ticks": str(config.red_debounce_ticks),
+        },
+        tone="muted",
+    )
+    return report
+
+
 def build_ci_watch_result(
     invocation: ChopInvocation,
     *,
@@ -1355,6 +1487,16 @@ def build_ci_watch_result(
         counters,
         status="ok" if actionable else "no_op",
         reason=None if actionable else "no_actions",
+        report=_build_ci_watch_report(
+            config,
+            counters,
+            states,
+            heads,
+            failures,
+            ledger_repos,
+            release_plans,
+            mode,
+        ),
     )
     for repo in mature_red_repos:
         prompt = ledger_repos[repo].pop("_prompt", None)

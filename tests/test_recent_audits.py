@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sase.core.axe_chop_facade import validate_chop_result
 
 from bugyi_chops.recent_audits import bug_main, improvement_main
 
@@ -61,6 +62,25 @@ def test_bug_audit_ports_recent_commit_prompt_and_head_context(
     assert f"#pr(recent_bug_audit_demo-project_{head[:12]})" in proposal["prompt"]
     assert "git.commits_since" in proposal["prompt"]
     assert "#!" not in proposal["prompt"]
+    report = result["report"]
+    assert report["title"] == "RECENT BUG AUDIT"
+    assert [block["kind"] for block in report["blocks"]] == [
+        "headline",
+        "heading",
+        "kv",
+        "kv",
+        "kv",
+        "heading",
+        "bullets",
+        "heading",
+        "bullets",
+    ]
+    assert report["blocks"][3]["items"][0] == {
+        "key": "head",
+        "value": head[:12],
+        "tone": None,
+    }
+    validate_chop_result(result)
 
 
 def test_improvement_audit_uses_vars_and_current_head_fallback(
@@ -81,6 +101,15 @@ def test_improvement_audit_uses_vars_and_current_head_fallback(
     assert "objective wins" in proposal["prompt"]
     assert "current HEAD" in proposal["prompt"]
     assert "#pr(recent_improvement_audit_demo_project_current)" in proposal["prompt"]
+    report = result["report"]
+    assert report["title"] == "RECENT IMPROVEMENT AUDIT"
+    assert report["blocks"][3]["items"][0] == {
+        "key": "head",
+        "value": "unknown",
+        "tone": "muted",
+    }
+    assert report["blocks"][-1]["items"][0]["tone"] == "muted"
+    validate_chop_result(result)
 
 
 def test_audit_fails_closed_for_missing_workspace_dir(
@@ -96,3 +125,5 @@ def test_audit_fails_closed_for_missing_workspace_dir(
     )
     assert result["status"] == "check_error"
     assert result["proposed_launches"] == []
+    assert result["report"]["blocks"][0]["tone"] == "error"
+    validate_chop_result(result)
