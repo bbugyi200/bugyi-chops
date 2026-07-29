@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from sase.axe.chop_script_context import ChopScriptContext
-from sase.chops import ChopArguments, ChopInvocation, ChopLogger
+from sase.chops import ChopArguments, ChopInvocation, ChopLogger, validate_chop_report
 from sase.core.axe_chop_facade import validate_chop_result
 
+import bugyi_chops.ci_watch as ci_watch_module
 from bugyi_chops.ci_watch import (
+    MAX_LEDGER_MERGES,
     MAX_LEDGER_NAMES,
+    RELEASE_LEDGER_FILE_NAME,
+    RELEASE_REPORT_FILE_NAME,
     ActstatClient,
     AgentProbe,
     AgentsGate,
@@ -38,6 +43,11 @@ REPO = "sase-org/sase"
 CORE = "sase-org/sase-core"
 SHA = "a" * 40
 CORE_SHA = "b" * 40
+FIXED_NOW = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
+
+
+def _clock_at(value: datetime) -> Callable[[], datetime]:
+    return lambda: value
 
 
 def _commit(
@@ -124,6 +134,8 @@ def _pr(
     merge_state: str = "CLEAN",
     checks: tuple[tuple[str, str], ...] = (("COMPLETED", "SUCCESS"),),
     head_ref: str = "release-please--branches--master",
+    title: str = "chore(main): release 1.2.3",
+    created_at: str = "2026-07-29T10:00:00Z",
 ) -> ReleasePr:
     return ReleasePr(
         number=number,
@@ -135,6 +147,8 @@ def _pr(
         merge_state_status=merge_state,
         checks=checks,
         url=f"https://github.com/{repo}/pull/{number}",
+        title=title,
+        created_at=created_at,
     )
 
 
@@ -158,7 +172,7 @@ class FakeGitHub:
         self.workflow_counts: dict[str, int | Exception] = {REPO: 1, CORE: 1}
         self.head_evidence: dict[str, HeadCiEvidence | Exception] = {}
         self.head_evidence_calls: list[tuple[str, str]] = []
-        self.numbers: dict[str, list[int]] = {REPO: [], CORE: []}
+        self.numbers: dict[str, list[int] | Exception] = {REPO: [], CORE: []}
         self.prs: dict[tuple[str, int], list[ReleasePr]] = {}
         self.busy: set[str] = set()
         self.merge_results: list[CommandResult] = []
@@ -193,7 +207,10 @@ class FakeGitHub:
         return repo in self.busy
 
     def release_pr_numbers(self, repo: str) -> list[int]:
-        return list(self.numbers[repo])
+        value = self.numbers[repo]
+        if isinstance(value, Exception):
+            raise value
+        return list(value)
 
     def release_pr(self, repo: str, number: int) -> ReleasePr:
         values = self.prs[(repo, number)]
@@ -216,7 +233,7 @@ class FakeAgents:
         self.error = error
         self.notify_ok = notify_ok
         self.probes = 0
-        self.notifications: list[tuple[str, str]] = []
+        self.notifications: list[dict[str, Any]] = []
 
     def probe(self) -> AgentProbe:
         self.probes += 1
@@ -224,8 +241,24 @@ class FakeAgents:
             raise CiWatchError("probe failed")
         return AgentProbe(self.names)
 
-    def notify(self, note: str, tag: str) -> bool:
-        self.notifications.append((note, tag))
+    def notify(
+        self,
+        notes: Sequence[str],
+        *,
+        icon: str | None = None,
+        action: str | None = None,
+        action_data: dict[str, str] | None = None,
+        tags: Sequence[str] = (),
+    ) -> bool:
+        self.notifications.append(
+            {
+                "notes": list(notes),
+                "icon": icon,
+                "action": action,
+                "action_data": action_data,
+                "tags": list(tags),
+            }
+        )
         return self.notify_ok
 
 
@@ -284,6 +317,7 @@ def _build(
     agents: FakeAgents | None = None,
     variables: dict[str, Any] | None = None,
     result_file: str = "result.json",
+    clock: Callable[[], datetime] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], FakeGitHub, FakeAgents]:
     github = github or FakeGitHub()
     agents = agents or FakeAgents()
@@ -292,6 +326,7 @@ def _build(
         actstat=FakeActstat(observations),  # type: ignore[arg-type]
         github=github,  # type: ignore[arg-type]
         agents=agents,  # type: ignore[arg-type]
+        **({"clock": clock} if clock is not None else {}),
     ).to_dict()
     evidence = result["evidence"]
     assert isinstance(evidence, list)
@@ -416,7 +451,7 @@ def test_red_idle_emits_one_pinned_sanitized_proposal(tmp_path: Path) -> None:
     assert SHA in proposal["prompt"]
     assert "token=do-not-leak" not in proposal["prompt"]
     assert "[redacted]" in proposal["prompt"]
-    assert agents.notifications[0][1] == "ci"
+    assert agents.notifications[0]["tags"] == ["ci"]
     assert ledger["repositories"][REPO]["notification"] == "failed"
     assert "token=" not in json.dumps(ledger).lower()
 
@@ -977,6 +1012,7 @@ def test_live_merge_uses_dependency_order_and_cap(
             releases={REPO: "release-please", CORE: "release-plz"},
             merge_enabled=True,
         ),
+        clock=lambda: FIXED_NOW,
     )
     assert result["counters"]["release_candidates"] == 2
     assert result["counters"]["merged"] == 1
@@ -984,7 +1020,21 @@ def test_live_merge_uses_dependency_order_and_cap(
     assert [plan.repo for plan in github.merges] == [CORE]
     assert ledger["repositories"][CORE]["reason"] == "merged"
     assert ledger["repositories"][REPO]["reason"] == "merge_cap_reached"
-    assert agents.notifications == [(f"Merged release PR #20 for {CORE}", "release")]
+    assert agents.notifications == [
+        {
+            "notes": [
+                f"Merged release PR #20 for {CORE}",
+                "1 merged today · 1 pending",
+            ],
+            "icon": "🚢",
+            "action": "ViewReport",
+            "action_data": {
+                "report_path": str((tmp_path / RELEASE_REPORT_FILE_NAME).resolve()),
+                "report_title": "Releases",
+            },
+            "tags": ["release"],
+        }
+    ]
 
 
 def test_live_merge_reread_fails_closed_on_changed_head_and_command_failure(
@@ -1063,6 +1113,269 @@ def test_release_candidate_errors_and_busy_generator_are_isolated(tmp_path: Path
         variables=_vars(releases={REPO: "release-please"}),
     )
     assert ledger["repositories"][REPO]["reason"] == "release_generator_busy"
+
+
+def _published_release_report(tmp_path: Path) -> dict[str, Any]:
+    document = json.loads((tmp_path / RELEASE_REPORT_FILE_NAME).read_text())
+    assert isinstance(document, dict)
+    assert validate_chop_report(document) == document
+    return cast(dict[str, Any], document)
+
+
+def _report_rows(
+    report: dict[str, Any],
+    columns: list[str],
+) -> list[dict[str, Any]]:
+    block = next(
+        block
+        for block in report["blocks"]
+        if block.get("kind") == "rows" and block.get("columns") == columns
+    )
+    rows = block["rows"]
+    assert isinstance(rows, list)
+    assert all(isinstance(row, dict) for row in rows)
+    return cast(list[dict[str, Any]], rows)
+
+
+def test_red_repo_release_pr_is_observed_and_reported_without_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    github = _release_github()
+    result, ledger, github, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        github=github,
+        variables=_vars(
+            releases={REPO: "release-please"},
+            fix_enabled=False,
+            merge_enabled=True,
+        ),
+        clock=lambda: FIXED_NOW,
+    )
+
+    assert result["counters"]["release_candidates"] == 1
+    assert result["counters"]["merged"] == 0
+    assert github.merges == []
+    assert ledger["repositories"][REPO]["release_reason"] == "default_branch_not_green"
+    pending = _report_rows(
+        _published_release_report(tmp_path),
+        ["REPOSITORY", "PR", "STATE", "AGE"],
+    )
+    assert pending[0]["cells"][:3] == [REPO, "#10", "base branch not green"]
+    assert pending[0]["tone"] == "error"
+
+
+def test_release_ledger_accumulates_prunes_and_recovers_from_corruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    variables = _vars(
+        releases={REPO: "release-please"},
+        merge_enabled=True,
+    )
+    first = _release_github()
+    _build(
+        tmp_path,
+        _observations(),
+        github=first,
+        variables=variables,
+        result_file="first.json",
+        clock=lambda: FIXED_NOW,
+    )
+    second = FakeGitHub()
+    second.numbers[REPO] = [11]
+    second.prs[(REPO, 11)] = [
+        _pr(11, title="chore: release v2.3.4", created_at="2026-07-29T11:00:00Z")
+    ]
+    _build(
+        tmp_path,
+        _observations(),
+        github=second,
+        variables=variables,
+        result_file="second.json",
+        clock=lambda: FIXED_NOW + timedelta(minutes=5),
+    )
+    ledger_path = tmp_path / RELEASE_LEDGER_FILE_NAME
+    ledger = json.loads(ledger_path.read_text())
+    assert [row["number"] for row in ledger["merges"]] == [10, 11]
+    assert [row["version"] for row in ledger["merges"]] == ["1.2.3", "2.3.4"]
+
+    many_merges = [
+        {
+            "repo": REPO,
+            "number": index + 1,
+            "url": f"https://github.com/{REPO}/pull/{index + 1}",
+            "head_oid": SHA,
+            "version": f"1.0.{index}",
+            "generator": "release-please",
+            "merged_at": (FIXED_NOW - timedelta(days=91 if index == 0 else 1)).isoformat(),
+        }
+        for index in range(MAX_LEDGER_MERGES + 3)
+    ]
+    ledger_path.write_text(
+        json.dumps({"version": 1, "merges": many_merges, "announced_pending": {}})
+    )
+    _build(
+        tmp_path,
+        _observations(),
+        variables=_vars(),
+        result_file="prune.json",
+        clock=lambda: FIXED_NOW,
+    )
+    pruned = json.loads(ledger_path.read_text())
+    assert len(pruned["merges"]) == MAX_LEDGER_MERGES
+    assert all(row["number"] != 1 for row in pruned["merges"])
+
+    ledger_path.write_text("{corrupt")
+    _build(
+        tmp_path,
+        _observations(),
+        variables=_vars(),
+        result_file="corrupt.json",
+        clock=lambda: FIXED_NOW,
+    )
+    assert json.loads(ledger_path.read_text()) == {
+        "announced_pending": {},
+        "merges": [],
+        "version": 1,
+    }
+
+
+def test_invalid_release_report_does_not_replace_last_good_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build(
+        tmp_path,
+        _observations(),
+        variables=_vars(),
+        result_file="good.json",
+        clock=lambda: FIXED_NOW,
+    )
+    report_path = tmp_path / RELEASE_REPORT_FILE_NAME
+    previous = report_path.read_bytes()
+
+    def reject_report(report: dict[str, Any]) -> dict[str, Any]:
+        del report
+        raise ValueError("synthetic invalid report")
+
+    monkeypatch.setattr(ci_watch_module, "validate_chop_report", reject_report)
+    _build(
+        tmp_path,
+        _observations(),
+        variables=_vars(),
+        result_file="invalid.json",
+        clock=lambda: FIXED_NOW + timedelta(minutes=5),
+    )
+    assert report_path.read_bytes() == previous
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("chore(main): release 0.9.3", "0.9.3"),
+        ("chore: release v0.9.3", "0.9.3"),
+        ("refresh release metadata", "-"),
+    ],
+)
+def test_release_version_extraction(title: str, expected: str) -> None:
+    assert ci_watch_module._extract_release_version(title) == expected
+
+
+def test_blocked_release_notification_is_debounced_and_not_repeated(
+    tmp_path: Path,
+) -> None:
+    agents = FakeAgents()
+    github = FakeGitHub()
+    github.numbers[REPO] = [10]
+    github.prs[(REPO, 10)] = [_pr(checks=(("IN_PROGRESS", ""),), created_at="2026-07-29T10:00:00Z")]
+    variables = _vars(releases={REPO: "release-please"})
+
+    for tick in range(3):
+        _build(
+            tmp_path,
+            _observations(),
+            github=github,
+            agents=agents,
+            variables=variables,
+            result_file=f"blocked-{tick}.json",
+            clock=_clock_at(FIXED_NOW + timedelta(minutes=5 * tick)),
+        )
+    assert len(agents.notifications) == 1
+    assert agents.notifications[0]["notes"] == [
+        f"Release PR #10 for {REPO} needs attention: checks not green"
+    ]
+    assert agents.notifications[0]["action"] == "ViewReport"
+
+    github.numbers[REPO] = []
+    _build(
+        tmp_path,
+        _observations(),
+        github=github,
+        agents=agents,
+        variables=variables,
+        result_file="closed.json",
+        clock=lambda: FIXED_NOW + timedelta(minutes=15),
+    )
+    github.numbers[REPO] = [11]
+    github.prs[(REPO, 11)] = [
+        _pr(11, checks=(("IN_PROGRESS", ""),), created_at="2026-07-29T12:00:00Z")
+    ]
+    for tick in range(2):
+        _build(
+            tmp_path,
+            _observations(),
+            github=github,
+            agents=agents,
+            variables=variables,
+            result_file=f"new-{tick}.json",
+            clock=_clock_at(FIXED_NOW + timedelta(minutes=20 + 5 * tick)),
+        )
+    assert [notification["notes"][0] for notification in agents.notifications] == [
+        f"Release PR #10 for {REPO} needs attention: checks not green",
+        f"Release PR #11 for {REPO} needs attention: checks not green",
+    ]
+
+
+def test_release_observation_failure_is_report_only_and_does_not_block_other_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    github = _release_github(two_repos=True)
+    github.numbers[REPO] = CiWatchError("gh unavailable")
+    agents = FakeAgents()
+    result, ledger, github, agents = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        github=github,
+        agents=agents,
+        variables=_vars(
+            releases={REPO: "release-please", CORE: "release-plz"},
+            merge_enabled=True,
+        ),
+        clock=lambda: FIXED_NOW,
+    )
+
+    assert result["counters"]["fix_proposed"] == 1
+    assert result["counters"]["merged"] == 1
+    assert [plan.repo for plan in github.merges] == [CORE]
+    assert ledger["repositories"][REPO]["reason"] == "fix_proposed"
+    assert ledger["repositories"][REPO]["release_reason"] == "gh unavailable"
+    assert {notification["tags"][0] for notification in agents.notifications} == {
+        "ci",
+        "release",
+    }
+    pending = _report_rows(
+        _published_release_report(tmp_path),
+        ["REPOSITORY", "PR", "STATE", "AGE"],
+    )
+    repo_row = next(row for row in pending if row["cells"][0] == REPO)
+    assert repo_row["tone"] == "error"
+    assert "gh unavailable" in repo_row["cells"][2]
 
 
 class QueueRunner:
@@ -1153,6 +1466,8 @@ def test_github_reader_covers_queries_and_mutation_argv() -> None:
         "mergeStateStatus": "CLEAN",
         "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
         "url": f"https://github.com/{REPO}/pull/10",
+        "title": "chore(main): release 1.2.3",
+        "createdAt": "2026-07-29T10:00:00Z",
     }
     runner = QueueRunner(
         CommandResult(0, '{"default_branch":"master"}'),
@@ -1450,7 +1765,13 @@ def test_agents_gate_parses_global_list_and_sends_json_notifications() -> None:
     )
     agents = AgentsGate("/sase", runner)
     assert agents.probe() == AgentProbe(("alpha", "beta"))
-    assert agents.notify("Merged release", "release")
+    assert agents.notify(
+        ["Merged release", "1 merged today · 0 pending"],
+        icon="🚢",
+        tags=["release"],
+        action="ViewReport",
+        action_data={"/fake": "value"},
+    )
     assert runner.calls[0][0] == ["/sase", "agent", "list", "-j"]
     assert runner.calls[1][0] == [
         "/sase",
@@ -1460,8 +1781,11 @@ def test_agents_gate_parses_global_list_and_sends_json_notifications() -> None:
         "ci_watch",
     ]
     assert json.loads(runner.calls[1][1] or "{}") == {
-        "notes": ["Merged release"],
+        "notes": ["Merged release", "1 merged today · 0 pending"],
         "tags": ["release"],
+        "icon": "🚢",
+        "action": "ViewReport",
+        "action_data": {"/fake": "value"},
     }
 
 
@@ -1546,6 +1870,8 @@ def test_release_pr_json_validation_and_near_miss_identity() -> None:
         "mergeStateStatus": "CLEAN",
         "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
         "url": f"https://github.com/{REPO}/pull/1",
+        "title": "chore(main): release 1.2.3",
+        "createdAt": "2026-07-29T10:00:00Z",
     }
     near_miss = ReleasePr.from_json(base)
     assert (
@@ -1566,3 +1892,7 @@ def test_release_pr_json_validation_and_near_miss_identity() -> None:
         ReleasePr.from_json({**base, "statusCheckRollup": [1]})
     with pytest.raises(CiWatchError, match="not a GitHub URL"):
         ReleasePr.from_json({**base, "url": "https://evil.example/token=bad"})
+    with pytest.raises(CiWatchError, match="missing or invalid 'title'"):
+        ReleasePr.from_json({**base, "title": ""})
+    with pytest.raises(CiWatchError, match="invalid createdAt"):
+        ReleasePr.from_json({**base, "createdAt": "not-a-date"})

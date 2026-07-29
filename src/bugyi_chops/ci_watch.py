@@ -8,15 +8,22 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import quote
 
-from sase.chops import ChopInvocation, ChopReport, ChopResultBuilder, Tone
+from sase.chops import (
+    ChopInvocation,
+    ChopReport,
+    ChopResultBuilder,
+    Tone,
+    validate_chop_report,
+)
 
 from bugyi_chops._common import context_vars, result_with_summary, run_chop, safe_fragment
 from bugyi_chops._report import add_facts_footer, start_report
@@ -39,8 +46,17 @@ MAX_LEDGER_NAMES = 10
 MAX_HEAD_RUNS = 20
 MAX_HEAD_JOBS = 100
 MAX_HEAD_EVIDENCE_REPOS_PER_TICK = 10
+MAX_RELEASE_PR_DETAILS = 8
+MAX_LEDGER_MERGES = 50
 MAX_TEXT = 240
 STREAK_FILE_NAME = "ci_watch_red_streaks.json"
+RELEASE_LEDGER_FILE_NAME = "ci_watch_releases.json"
+RELEASE_REPORT_FILE_NAME = "ci_watch_releases.report.json"
+RELEASE_LEDGER_RETENTION_DAYS = 90
+RELEASE_REPORT_WINDOW_DAYS = 30
+RELEASE_VERSION_PATTERN = re.compile(
+    r"(?<![0-9A-Za-z])v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)"
+)
 
 type JsonObject = dict[str, Any]
 
@@ -418,6 +434,8 @@ class ReleasePr:
     merge_state_status: str
     checks: tuple[tuple[str, str], ...]
     url: str
+    title: str
+    created_at: str
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> ReleasePr:
@@ -440,6 +458,14 @@ class ReleasePr:
         url = str(value.get("url", ""))
         if url and not url.startswith("https://github.com/"):
             raise CiWatchError("release PR URL is not a GitHub URL")
+        title = _bounded(_required_string(value, "title"))
+        created_at = _required_string(value, "createdAt")
+        try:
+            parsed_created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise CiWatchError("release PR has an invalid createdAt") from error
+        if parsed_created_at.tzinfo is None:
+            raise CiWatchError("release PR has an invalid createdAt")
         return cls(
             number=number,
             head_ref_name=_branch(value.get("headRefName")),
@@ -450,6 +476,8 @@ class ReleasePr:
             merge_state_status=str(value.get("mergeStateStatus", "")).upper(),
             checks=tuple(checks),
             url=url,
+            title=title,
+            created_at=_bounded(created_at),
         )
 
 
@@ -457,6 +485,14 @@ class ReleasePr:
 class MergePlan:
     repo: str
     pr: ReleasePr
+
+
+@dataclass(frozen=True)
+class ReleaseObservation:
+    repo: str
+    numbers: tuple[int, ...] | None
+    prs: tuple[ReleasePr, ...] = ()
+    error: str | None = None
 
 
 def plan_release_merge(
@@ -784,7 +820,7 @@ class GitHubReader:
                 "--json",
                 (
                     "number,isDraft,baseRefName,headRefName,headRefOid,"
-                    "mergeable,mergeStateStatus,statusCheckRollup,url"
+                    "mergeable,mergeStateStatus,statusCheckRollup,url,title,createdAt"
                 ),
             ],
             source=f"{repo} PR #{number}",
@@ -841,8 +877,29 @@ class AgentsGate:
             names.append(_bounded(name, limit=100))
         return AgentProbe(tuple(names))
 
-    def notify(self, note: str, tag: str) -> bool:
-        payload = json.dumps({"notes": [_bounded(note)], "tags": [tag]})
+    def notify(
+        self,
+        notes: Sequence[str],
+        *,
+        icon: str | None = None,
+        action: str | None = None,
+        action_data: Mapping[str, str] | None = None,
+        tags: Sequence[str] = (),
+    ) -> bool:
+        payload_data: JsonObject = {
+            "notes": [_bounded(note) for note in notes],
+            "tags": [_bounded(tag, limit=64) for tag in tags],
+        }
+        if icon is not None:
+            payload_data["icon"] = _bounded(icon, limit=16)
+        if action is not None:
+            payload_data["action"] = _bounded(action, limit=64)
+        if action_data is not None:
+            payload_data["action_data"] = {
+                _bounded(key, limit=64): _bounded(value, limit=4096)
+                for key, value in action_data.items()
+            }
+        payload = json.dumps(payload_data)
         result = self._runner(
             [self.executable, "notify", "create", "-s", CHOP_NAME],
             input_text=payload,
@@ -1023,6 +1080,103 @@ def _atomic_write_json(destination: Path, value: Mapping[str, Any]) -> None:
         raise
 
 
+def _local_now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _parse_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp has no timezone")
+    return parsed
+
+
+def _extract_release_version(title: str) -> str:
+    match = RELEASE_VERSION_PATTERN.search(_bounded(title))
+    return match.group(1) if match is not None else "-"
+
+
+def _empty_release_ledger() -> JsonObject:
+    return {"version": 1, "merges": [], "announced_pending": {}}
+
+
+def _load_release_ledger(invocation: ChopInvocation, now: datetime) -> JsonObject:
+    path = Path(invocation.context.state_dir) / RELEASE_LEDGER_FILE_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _empty_release_ledger()
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return _empty_release_ledger()
+
+    raw_merges = raw.get("merges")
+    if not isinstance(raw_merges, list):
+        return _empty_release_ledger()
+    cutoff = now - timedelta(days=RELEASE_LEDGER_RETENTION_DAYS)
+    merges: list[JsonObject] = []
+    for row in raw_merges:
+        if not isinstance(row, dict):
+            continue
+        try:
+            repo = _repo(row.get("repo"))
+            number = row.get("number")
+            if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+                raise CiWatchError("invalid release ledger PR number")
+            url = _required_string(row, "url")
+            if not url.startswith("https://github.com/"):
+                raise CiWatchError("invalid release ledger URL")
+            head_oid = _sha(row.get("head_oid"))
+            version = _bounded(_required_string(row, "version"), limit=80)
+            generator = _bounded(_required_string(row, "generator"), limit=80)
+            merged_at = _required_string(row, "merged_at")
+            parsed_merged_at = _parse_timestamp(merged_at).astimezone(now.tzinfo)
+        except (CiWatchError, ValueError):
+            continue
+        if parsed_merged_at < cutoff:
+            continue
+        merges.append(
+            {
+                "repo": repo,
+                "number": number,
+                "url": url,
+                "head_oid": head_oid,
+                "version": version,
+                "generator": generator,
+                "merged_at": merged_at,
+            }
+        )
+
+    announced: JsonObject = {}
+    raw_announced = raw.get("announced_pending")
+    if isinstance(raw_announced, dict):
+        for key, row in raw_announced.items():
+            if not isinstance(key, str) or not isinstance(row, dict):
+                continue
+            consecutive_ticks = row.get("consecutive_ticks")
+            notified = row.get("notified")
+            if (
+                not isinstance(consecutive_ticks, int)
+                or isinstance(consecutive_ticks, bool)
+                or consecutive_ticks < 0
+                or not isinstance(notified, bool)
+            ):
+                continue
+            announced[_bounded(key, limit=MAX_TEXT)] = {
+                "consecutive_ticks": consecutive_ticks,
+                "notified": notified,
+            }
+    return {
+        "version": 1,
+        "merges": merges[-MAX_LEDGER_MERGES:],
+        "announced_pending": announced,
+    }
+
+
+def _write_release_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> None:
+    destination = Path(invocation.context.state_dir) / RELEASE_LEDGER_FILE_NAME
+    _atomic_write_json(destination, ledger)
+
+
 def _load_streaks(invocation: ChopInvocation) -> dict[str, tuple[tuple[str, ...], int]]:
     path = Path(invocation.context.state_dir) / STREAK_FILE_NAME
     try:
@@ -1145,6 +1299,182 @@ def _release_tone(reason: str) -> Tone:
     return "warn"
 
 
+_RELEASE_REASON_LABELS = {
+    "eligible": "ready to merge",
+    "default_branch_not_green": "base branch not green",
+    "ambiguous_release_prs": "multiple release PRs",
+    "not_release_pr": "not a release PR",
+    "release_pr_draft": "draft",
+    "release_pr_wrong_base": "wrong base branch",
+    "release_pr_not_mergeable": "not mergeable",
+    "release_pr_not_clean": "merge state not clean",
+    "release_pr_empty_rollup": "checks unavailable",
+    "release_pr_checks_not_green": "checks not green",
+    "release_generator_busy": "release generator running",
+    "release_pr_head_changed": "PR changed during merge",
+    "merge_cap_reached": "merge cap reached",
+    "merge_disabled": "merge disabled",
+    "merge_context_unavailable": "merge context unavailable",
+    "dry_run": "dry run",
+    "merge_failed": "merge failed",
+}
+_NON_BLOCKING_RELEASE_REASONS = frozenset({"eligible", "release_generator_busy"})
+
+
+def _humanize_release_reason(reason: str) -> str:
+    return _RELEASE_REASON_LABELS.get(reason, _bounded(reason.replace("_", " ")))
+
+
+def _release_reason_tone(reason: str) -> Tone:
+    if reason == "no_release_pr":
+        return "muted"
+    if reason in _NON_BLOCKING_RELEASE_REASONS:
+        return "warn"
+    return "error"
+
+
+def _format_release_age(created_at: str, now: datetime) -> str:
+    try:
+        delta = max(now - _parse_timestamp(created_at).astimezone(now.tzinfo), timedelta())
+    except ValueError:
+        return "-"
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "<1m"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _release_order(config: Config) -> list[str]:
+    ordered = [repo for repo in config.merge_order if repo in config.release_repositories]
+    ordered.extend(repo for repo in config.release_repositories if repo not in ordered)
+    return ordered
+
+
+def _build_release_report(
+    config: Config,
+    release_ledger: Mapping[str, Any],
+    observations: Mapping[str, ReleaseObservation],
+    decisions: Mapping[str, str],
+    now: datetime,
+    merged_keys: set[str],
+) -> ChopReport:
+    raw_merges = release_ledger.get("merges")
+    merges = (
+        [row for row in raw_merges if isinstance(row, dict)] if isinstance(raw_merges, list) else []
+    )
+    recent_cutoff = now - timedelta(days=RELEASE_REPORT_WINDOW_DAYS)
+    recent = [
+        row
+        for row in merges
+        if isinstance(row.get("merged_at"), str)
+        and _parse_timestamp(str(row["merged_at"])).astimezone(now.tzinfo) >= recent_cutoff
+    ]
+    recent.sort(
+        key=lambda row: _parse_timestamp(str(row["merged_at"])),
+        reverse=True,
+    )
+    merged_today = sum(
+        _parse_timestamp(str(row["merged_at"])).astimezone(now.tzinfo).date() == now.date()
+        for row in merges
+    )
+
+    pending_repos = [
+        repo
+        for repo in _release_order(config)
+        if observations[repo].numbers
+        and not all(
+            f"{repo}#{number}" in merged_keys for number in observations[repo].numbers or ()
+        )
+    ]
+    blocked = sum(
+        decisions.get(repo, "") not in _NON_BLOCKING_RELEASE_REASONS for repo in pending_repos
+    )
+    headline_tone: Tone = "error" if blocked else "warn" if pending_repos else "ok"
+    report = ChopReport(title="RELEASES").headline(
+        f"{merged_today} merged today · {len(pending_repos)} pending · {blocked} blocked",
+        tone=headline_tone,
+    )
+
+    report.heading("RECENT")
+    recent_rows = report.rows(columns=("REPOSITORY", "PR", "VERSION", "MERGED"))
+    for row in recent[:8]:
+        merged_at = _parse_timestamp(str(row["merged_at"])).astimezone(now.tzinfo)
+        recent_rows.row(
+            (
+                str(row["repo"]),
+                f"#{row['number']}",
+                str(row["version"]),
+                merged_at.strftime("%m-%d %H:%M"),
+            ),
+            tone="ok",
+            glyph="✓",
+        )
+    if not recent:
+        recent_rows.row(("-", "-", "-", "no recent releases"), tone="muted", glyph="·")
+
+    report.heading("PENDING")
+    pending_rows = report.rows(columns=("REPOSITORY", "PR", "STATE", "AGE"))
+    for repo in _release_order(config):
+        observation = observations[repo]
+        unmerged_numbers = [
+            number for number in observation.numbers or () if f"{repo}#{number}" not in merged_keys
+        ]
+        if observation.numbers is None:
+            pending_rows.row(
+                (
+                    repo,
+                    "-",
+                    _humanize_release_reason(observation.error or "observation failed"),
+                    "-",
+                ),
+                tone="error",
+                glyph="!",
+            )
+            continue
+        if not unmerged_numbers:
+            pending_rows.row((repo, "-", "no release PR", "-"), tone="muted", glyph="·")
+            continue
+        number = unmerged_numbers[0]
+        pr = next((candidate for candidate in observation.prs if candidate.number == number), None)
+        reason = decisions.get(repo, observation.error or "observation failed")
+        tone = _release_reason_tone(reason)
+        pending_rows.row(
+            (
+                repo,
+                f"#{number}",
+                _humanize_release_reason(reason),
+                _format_release_age(pr.created_at, now) if pr is not None else "-",
+            ),
+            tone=tone,
+            glyph="◆" if tone == "warn" else "▲",
+        )
+
+    report.divider().kv(
+        {
+            "updated": now.strftime("%m-%d %H:%M"),
+            "window": f"{RELEASE_REPORT_WINDOW_DAYS}d",
+            "merges recorded": str(len(merges)),
+        },
+        tone="muted",
+    )
+    return report
+
+
+def _publish_release_report(invocation: ChopInvocation, report: ChopReport) -> bool:
+    destination = Path(invocation.context.state_dir).resolve() / RELEASE_REPORT_FILE_NAME
+    try:
+        document = validate_chop_report(report.to_dict())
+        _atomic_write_json(destination, document)
+    except (OSError, TypeError, ValueError) as error:
+        invocation.logger.warning(f"{CHOP_NAME}: release report publish skipped: {_bounded(error)}")
+        return False
+    return True
+
+
 def _build_ci_watch_report(
     config: Config,
     counters: Mapping[str, int],
@@ -1199,7 +1529,9 @@ def _build_ci_watch_report(
         )
         for repo in release_order:
             ledger_row = ledger_repos.get(repo, {})
-            reason = str(ledger_row.get("reason", states[repo].value))
+            reason = str(
+                ledger_row.get("release_reason", ledger_row.get("reason", states[repo].value))
+            )
             pr_number = ledger_row.get("merged_pr") or ledger_row.get("planned_pr")
             if pr_number is None and repo in plans:
                 pr_number = plans[repo].pr.number
@@ -1231,11 +1563,16 @@ def build_ci_watch_result(
     actstat: ActstatClient | None = None,
     github: GitHubReader | None = None,
     agents: AgentsGate | None = None,
+    clock: Callable[[], datetime] = _local_now,
 ) -> ChopResultBuilder:
     config = Config.from_invocation(invocation)
     actstat = actstat or ActstatClient(config.actstat_bin)
     github = github or GitHubReader(config.gh_bin)
     agents = agents or AgentsGate(config.sase_bin)
+    now = clock().astimezone()
+    release_ledger = _load_release_ledger(invocation, now)
+    release_merges = cast(list[JsonObject], release_ledger["merges"])
+    announced_pending = cast(dict[str, JsonObject], release_ledger["announced_pending"])
     observations = actstat.sweep(config.repos)
     counters = _new_counters(len(config.repos))
     states: dict[str, RepoState] = {}
@@ -1371,7 +1708,8 @@ def build_ci_watch_result(
                         counters["fix_proposed"] += 1
                         _mark(ledger_repos, repo, reason="fix_proposed")
                         if not agents.notify(
-                            f"Proposed a CI repair for {repo} at {failure.sha[:7]}", "ci"
+                            [f"Proposed a CI repair for {repo} at {failure.sha[:7]}"],
+                            tags=["ci"],
                         ):
                             ledger_repos[repo]["notification"] = "failed"
                         ledger_repos[repo]["proposal"] = {
@@ -1385,44 +1723,108 @@ def build_ci_watch_result(
 
     _write_streaks(invocation, streaks)
 
-    release_plans: list[MergePlan] = []
-    for repo in config.merge_order:
-        generator = config.release_repositories.get(repo)
-        if generator is None or states[repo] is not RepoState.GREEN:
-            continue
-        head = heads[repo]
+    release_observations: dict[str, ReleaseObservation] = {}
+    remaining_details = MAX_RELEASE_PR_DETAILS
+    for repo in _release_order(config):
         try:
-            numbers = github.release_pr_numbers(repo)
-            counters["release_candidates"] += len(numbers)
-            candidates = [github.release_pr(repo, number) for number in numbers]
+            numbers = tuple(github.release_pr_numbers(repo))
+        except CiWatchError as error:
+            release_observations[repo] = ReleaseObservation(
+                repo,
+                None,
+                error=_bounded(error),
+            )
+            continue
+        counters["release_candidates"] += len(numbers)
+        candidates: list[ReleasePr] = []
+        observation_error = None
+        for number in numbers:
+            if remaining_details <= 0:
+                observation_error = (
+                    f"release PR detail cap reached ({MAX_RELEASE_PR_DETAILS} per tick)"
+                )
+                break
+            remaining_details -= 1
+            try:
+                candidates.append(github.release_pr(repo, number))
+            except CiWatchError as error:
+                observation_error = _bounded(error)
+                break
+        release_observations[repo] = ReleaseObservation(
+            repo,
+            numbers,
+            tuple(candidates),
+            observation_error,
+        )
+
+    release_plans: list[MergePlan] = []
+    release_decisions: dict[str, str] = {}
+    for repo in _release_order(config):
+        release_observation = release_observations[repo]
+        plan = None
+        if release_observation.numbers is None:
+            reason = release_observation.error or "release observation failed"
+        elif not release_observation.numbers:
+            reason = "no_release_pr"
+        elif release_observation.error is not None:
+            reason = release_observation.error
+        elif states[repo] is not RepoState.GREEN:
             plan, reason = plan_release_merge(
                 repo,
                 states[repo],
-                head.branch,
-                candidates,
-                generator_busy=github.generator_busy(repo, head.branch, generator),
+                "",
+                release_observation.prs,
+                generator_busy=False,
             )
-        except CiWatchError as error:
-            counters["merge_skipped"] += 1
-            _mark(ledger_repos, repo, reason=str(error))
-            continue
+        else:
+            head = heads[repo]
+            try:
+                plan, reason = plan_release_merge(
+                    repo,
+                    states[repo],
+                    head.branch,
+                    release_observation.prs,
+                    generator_busy=github.generator_busy(
+                        repo,
+                        head.branch,
+                        config.release_repositories[repo],
+                    ),
+                )
+            except CiWatchError as error:
+                reason = _bounded(error)
+        release_decisions[repo] = reason
+        ledger_repos[repo]["release_reason"] = reason
+        if states[repo] is RepoState.GREEN:
+            ledger_repos[repo]["reason"] = reason
         if plan is None:
-            if numbers:
+            if release_observation.numbers and states[repo] is RepoState.GREEN:
                 counters["merge_skipped"] += 1
-            _mark(ledger_repos, repo, reason=reason)
             continue
         release_plans.append(plan)
 
     mode = _dry_run_mode()
+    merged_keys: set[str] = set()
+    merged_notifications: list[tuple[str, ReleasePr]] = []
     for plan in release_plans:
         repo = plan.repo
         if counters["merged"] >= config.max_merges:
             counters["merge_skipped"] += 1
-            _mark(ledger_repos, repo, reason="merge_cap_reached")
+            _mark(
+                ledger_repos,
+                repo,
+                reason="merge_cap_reached",
+                release_reason="merge_cap_reached",
+            )
             continue
         if not config.merge_enabled:
             counters["merge_skipped"] += 1
-            _mark(ledger_repos, repo, reason="merge_disabled", planned_pr=plan.pr.number)
+            _mark(
+                ledger_repos,
+                repo,
+                reason="merge_disabled",
+                release_reason="merge_disabled",
+                planned_pr=plan.pr.number,
+            )
             continue
         if mode == "unavailable":
             counters["merge_skipped"] += 1
@@ -1430,12 +1832,19 @@ def build_ci_watch_result(
                 ledger_repos,
                 repo,
                 reason="merge_context_unavailable",
+                release_reason="merge_context_unavailable",
                 planned_pr=plan.pr.number,
             )
             continue
         if mode == "dry_run":
             counters["merge_skipped"] += 1
-            _mark(ledger_repos, repo, reason="dry_run", planned_pr=plan.pr.number)
+            _mark(
+                ledger_repos,
+                repo,
+                reason="dry_run",
+                release_reason="dry_run",
+                planned_pr=plan.pr.number,
+            )
             continue
         try:
             current = github.release_pr(repo, plan.pr.number)
@@ -1458,27 +1867,169 @@ def build_ci_watch_result(
                         if current.head_oid != plan.pr.head_oid
                         else current_reason
                     ),
+                    release_reason=(
+                        "release_pr_head_changed"
+                        if current.head_oid != plan.pr.head_oid
+                        else current_reason
+                    ),
                 )
                 continue
             merge_result = github.merge(current_plan)
         except CiWatchError as error:
             counters["merge_skipped"] += 1
-            _mark(ledger_repos, repo, reason=str(error))
+            _mark(
+                ledger_repos,
+                repo,
+                reason=str(error),
+                release_reason=str(error),
+            )
             continue
         if merge_result.returncode != 0:
             counters["merge_skipped"] += 1
-            _mark(ledger_repos, repo, reason="merge_failed")
+            _mark(
+                ledger_repos,
+                repo,
+                reason="merge_failed",
+                release_reason="merge_failed",
+            )
             continue
         counters["merged"] += 1
+        merged_pr = current
+        merged_key = f"{repo}#{merged_pr.number}"
+        merged_keys.add(merged_key)
+        merged_notifications.append((repo, merged_pr))
+        release_merges.append(
+            {
+                "repo": repo,
+                "number": merged_pr.number,
+                "url": merged_pr.url,
+                "head_oid": merged_pr.head_oid,
+                "version": _extract_release_version(merged_pr.title),
+                "generator": config.release_repositories[repo],
+                "merged_at": now.isoformat(),
+            }
+        )
+        release_merges[:] = release_merges[-MAX_LEDGER_MERGES:]
         _mark(
             ledger_repos,
             repo,
             reason="merged",
-            merged_pr=plan.pr.number,
-            head_oid=plan.pr.head_oid,
+            release_reason="merged",
+            merged_pr=merged_pr.number,
+            head_oid=merged_pr.head_oid,
         )
-        if not agents.notify(f"Merged release PR #{plan.pr.number} for {repo}", "release"):
+
+    pending_notifications: list[tuple[str, int, str]] = []
+    configured_release_repos = set(config.release_repositories)
+    for key in list(announced_pending):
+        repo, separator, raw_number = key.rpartition("#")
+        stored_release_observation = release_observations.get(repo)
+        if (
+            not separator
+            or repo not in configured_release_repos
+            or not raw_number.isdigit()
+            or key in merged_keys
+            or (
+                stored_release_observation is not None
+                and stored_release_observation.numbers is not None
+                and int(raw_number) not in stored_release_observation.numbers
+            )
+        ):
+            announced_pending.pop(key, None)
+    for repo, release_observation in release_observations.items():
+        if release_observation.numbers is None:
+            continue
+        reason = release_decisions[repo]
+        blocked = reason not in _NON_BLOCKING_RELEASE_REASONS
+        for number in release_observation.numbers:
+            key = f"{repo}#{number}"
+            if key in merged_keys:
+                announced_pending.pop(key, None)
+                continue
+            pending_row = announced_pending.get(key, {})
+            previous_ticks = pending_row.get("consecutive_ticks", 0)
+            notified = pending_row.get("notified") is True
+            consecutive_ticks = (
+                int(previous_ticks) + 1 if blocked and isinstance(previous_ticks, int) else 0
+            )
+            announced_pending[key] = {
+                "consecutive_ticks": consecutive_ticks,
+                "notified": notified,
+            }
+            if blocked and consecutive_ticks >= 2 and not notified:
+                pending_notifications.append((repo, number, reason))
+
+    try:
+        _write_release_ledger(invocation, release_ledger)
+    except OSError as error:
+        invocation.logger.warning(f"{CHOP_NAME}: release ledger write skipped: {_bounded(error)}")
+
+    try:
+        release_report = _build_release_report(
+            config,
+            release_ledger,
+            release_observations,
+            release_decisions,
+            now,
+            merged_keys,
+        )
+    except (TypeError, ValueError) as error:
+        invocation.logger.warning(f"{CHOP_NAME}: release report build skipped: {_bounded(error)}")
+    else:
+        _publish_release_report(invocation, release_report)
+
+    merged_today = sum(
+        _parse_timestamp(str(row["merged_at"])).astimezone(now.tzinfo).date() == now.date()
+        for row in release_merges
+    )
+    pending_count = sum(
+        bool(observation.numbers)
+        and not all(f"{repo}#{number}" in merged_keys for number in observation.numbers or ())
+        for repo, observation in release_observations.items()
+    )
+    report_path = str(Path(invocation.context.state_dir).resolve() / RELEASE_REPORT_FILE_NAME)
+    release_action_data = {
+        "report_path": report_path,
+        "report_title": "Releases",
+    }
+    for repo, pr in merged_notifications:
+        if not agents.notify(
+            [
+                f"Merged release PR #{pr.number} for {repo}",
+                f"{merged_today} merged today · {pending_count} pending",
+            ],
+            icon="🚢",
+            tags=["release"],
+            action="ViewReport",
+            action_data=release_action_data,
+        ):
             ledger_repos[repo]["notification"] = "failed"
+    pending_state_changed = False
+    for repo, number, reason in pending_notifications:
+        notification_ok = agents.notify(
+            [
+                (
+                    f"Release PR #{number} for {repo} needs attention: "
+                    f"{_humanize_release_reason(reason)}"
+                )
+            ],
+            icon="🚢",
+            tags=["release"],
+            action="ViewReport",
+            action_data=release_action_data,
+        )
+        if notification_ok:
+            announced_pending[f"{repo}#{number}"]["notified"] = True
+            pending_state_changed = True
+        else:
+            ledger_repos[repo]["release_notification"] = "failed"
+    if pending_state_changed:
+        try:
+            _write_release_ledger(invocation, release_ledger)
+        except OSError as error:
+            invocation.logger.warning(
+                f"{CHOP_NAME}: pending notification ledger write skipped: {_bounded(error)}"
+            )
 
     actionable = bool(counters["fix_proposed"] or counters["merged"])
     result = result_with_summary(
