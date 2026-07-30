@@ -13,6 +13,9 @@ from sase.core.axe_chop_facade import validate_chop_result
 
 import bugyi_chops.ci_watch as ci_watch_module
 from bugyi_chops.ci_watch import (
+    FIX_LEDGER_FILE_NAME,
+    FIX_LEDGER_RETENTION_DAYS,
+    MAX_ANNOUNCED_FIXES,
     MAX_LEDGER_MERGES,
     MAX_LEDGER_NAMES,
     RELEASE_LEDGER_FILE_NAME,
@@ -443,7 +446,8 @@ def test_red_idle_emits_one_pinned_sanitized_proposal(tmp_path: Path) -> None:
     assert result["counters"]["fix_proposed"] == 1
     proposal = result["proposed_launches"][0]
     assert proposal["workspace"] == f"gh:{REPO}"
-    assert proposal["agent_name"] == "ci_fix.sase"
+    assert proposal["agent_name"] == "ci_fix.sase.@"
+    assert proposal["agent_name"] != "ci_fix.sase"
     assert proposal["dedupe_key"] == ledger["repositories"][REPO]["proposal"]["dedupe_key"]
     assert SHA not in proposal["dedupe_key"]
     assert "#pr(ci_fix_sase_aaaaaaa, status=ready)" in proposal["prompt"]
@@ -451,9 +455,13 @@ def test_red_idle_emits_one_pinned_sanitized_proposal(tmp_path: Path) -> None:
     assert SHA in proposal["prompt"]
     assert "token=do-not-leak" not in proposal["prompt"]
     assert "[redacted]" in proposal["prompt"]
+    assert agents.notifications[0]["icon"] == "🛠"
     assert agents.notifications[0]["tags"] == ["ci"]
+    assert agents.notifications[0]["notes"][1].startswith("Failing jobs:")
     assert ledger["repositories"][REPO]["notification"] == "failed"
     assert "token=" not in json.dumps(ledger).lower()
+    fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
+    assert fix_ledger["announced"] == {}
 
 
 def test_unrelated_agents_do_not_block_fixes_and_proposals_are_capped(
@@ -863,6 +871,165 @@ def test_dedupe_key_is_stable_across_head_shas(tmp_path: Path) -> None:
     assert (
         first["proposed_launches"][0]["dedupe_key"] == second["proposed_launches"][0]["dedupe_key"]
     )
+
+
+def test_green_starts_a_new_fix_episode(tmp_path: Path) -> None:
+    first, first_ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        clock=_clock_at(FIXED_NOW),
+    )
+    _, green_ledger, _, _ = _build(
+        tmp_path,
+        _observations(),
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    second, second_ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=10)),
+    )
+
+    first_key = first["proposed_launches"][0]["dedupe_key"]
+    second_key = second["proposed_launches"][0]["dedupe_key"]
+    assert first_key.endswith(":e0")
+    assert second_key.endswith(":e1")
+    assert first_key != second_key
+    assert first_ledger["repositories"][REPO]["fix_episode"] == 0
+    assert green_ledger["repositories"][REPO]["fix_episode"] == 1
+    assert second_ledger["repositories"][REPO]["fix_episode"] == 1
+    fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
+    assert fix_ledger["repos"][REPO] == {"episode": 1, "red": True}
+
+
+@pytest.mark.parametrize("middle_state", ["pending", "no_ci"])
+def test_unsettled_state_does_not_start_a_new_fix_episode(
+    tmp_path: Path,
+    middle_state: str,
+) -> None:
+    first, _, _, _ = _build(tmp_path, _observations(red=(REPO,)))
+    observations = _observations()
+    github = FakeGitHub()
+    if middle_state == "pending":
+        observations[REPO] = RepoObservation(
+            REPO,
+            commit=_commit(REPO, SHA, "cancelled"),
+        )
+    else:
+        observations[REPO] = RepoObservation(REPO, error="missing_observation")
+        github.workflow_counts[REPO] = 0
+    _, middle_ledger, _, _ = _build(tmp_path, observations, github=github)
+    second, second_ledger, _, _ = _build(tmp_path, _observations(red=(REPO,)))
+
+    assert middle_ledger["repositories"][REPO]["state"] == middle_state
+    assert middle_ledger["repositories"][REPO]["fix_episode"] == 0
+    assert second_ledger["repositories"][REPO]["fix_episode"] == 0
+    assert (
+        first["proposed_launches"][0]["dedupe_key"] == second["proposed_launches"][0]["dedupe_key"]
+    )
+
+
+def test_fix_notification_is_sent_once_without_suppressing_proposal(
+    tmp_path: Path,
+) -> None:
+    agents = FakeAgents()
+    first, _, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        agents=agents,
+        clock=_clock_at(FIXED_NOW),
+    )
+    second, second_ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        agents=agents,
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+
+    assert len(agents.notifications) == 1
+    assert len(first["proposed_launches"]) == 1
+    assert len(second["proposed_launches"]) == 1
+    assert second_ledger["repositories"][REPO]["notification"] == "already_announced"
+
+
+def test_failed_fix_notification_is_retried(tmp_path: Path) -> None:
+    first_agents = FakeAgents(notify_ok=False)
+    _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        agents=first_agents,
+        clock=_clock_at(FIXED_NOW),
+    )
+    fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
+    assert fix_ledger["announced"] == {}
+
+    second_agents = FakeAgents()
+    _, second_ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        agents=second_agents,
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+
+    assert len(first_agents.notifications) == 1
+    assert len(second_agents.notifications) == 1
+    assert "notification" not in second_ledger["repositories"][REPO]
+    fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
+    assert len(fix_ledger["announced"]) == 1
+
+
+def test_fix_ledger_absence_and_corruption_fall_back_to_empty(tmp_path: Path) -> None:
+    ledger_path = tmp_path / FIX_LEDGER_FILE_NAME
+    assert not ledger_path.exists()
+    first, _, _, _ = _build(tmp_path, _observations(red=(REPO,)))
+    assert len(first["proposed_launches"]) == 1
+    assert ledger_path.is_file()
+
+    ledger_path.write_text('{"version":1,"repos":', encoding="utf-8")
+    second, _, _, _ = _build(tmp_path, _observations(red=(REPO,)))
+    assert len(second["proposed_launches"]) == 1
+    recovered = json.loads(ledger_path.read_text())
+    assert recovered["version"] == 1
+    assert recovered["repos"][REPO] == {"episode": 0, "red": True}
+
+
+def test_fix_ledger_prunes_unconfigured_expired_and_overflow_rows(
+    tmp_path: Path,
+) -> None:
+    extra_repo = "example/unconfigured"
+    oldest = FIXED_NOW - timedelta(days=FIX_LEDGER_RETENTION_DAYS + 1)
+    valid_keys = [f"ci_fix:{REPO}:{index:016x}:e0" for index in range(MAX_ANNOUNCED_FIXES + 3)]
+    announced = {
+        key: (FIXED_NOW - timedelta(minutes=len(valid_keys) - index)).isoformat()
+        for index, key in enumerate(valid_keys)
+    }
+    announced[f"ci_fix:{REPO}:ffffffffffffffff:e99"] = oldest.isoformat()
+    announced[f"ci_fix:{extra_repo}:eeeeeeeeeeeeeeee:e0"] = FIXED_NOW.isoformat()
+    (tmp_path / FIX_LEDGER_FILE_NAME).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repos": {
+                    REPO: {"episode": 0, "red": False},
+                    extra_repo: {"episode": 7, "red": True},
+                },
+                "announced": announced,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _build(
+        tmp_path,
+        _observations(),
+        clock=_clock_at(FIXED_NOW),
+    )
+    pruned = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
+
+    assert extra_repo not in pruned["repos"]
+    assert len(pruned["announced"]) == MAX_ANNOUNCED_FIXES
+    assert set(pruned["announced"]) == set(valid_keys[-MAX_ANNOUNCED_FIXES:])
+    assert all(f":{extra_repo}:" not in key for key in pruned["announced"])
 
 
 @pytest.mark.parametrize(

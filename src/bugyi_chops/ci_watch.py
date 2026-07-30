@@ -48,10 +48,13 @@ MAX_HEAD_JOBS = 100
 MAX_HEAD_EVIDENCE_REPOS_PER_TICK = 10
 MAX_RELEASE_PR_DETAILS = 8
 MAX_LEDGER_MERGES = 50
+MAX_ANNOUNCED_FIXES = 100
 MAX_TEXT = 240
 STREAK_FILE_NAME = "ci_watch_red_streaks.json"
+FIX_LEDGER_FILE_NAME = "ci_watch_fixes.json"
 RELEASE_LEDGER_FILE_NAME = "ci_watch_releases.json"
 RELEASE_REPORT_FILE_NAME = "ci_watch_releases.report.json"
+FIX_LEDGER_RETENTION_DAYS = 90
 RELEASE_LEDGER_RETENTION_DAYS = 90
 RELEASE_REPORT_WINDOW_DAYS = 30
 RELEASE_VERSION_PATTERN = re.compile(
@@ -1007,6 +1010,11 @@ def _commit_sha(observation: RepoObservation) -> str:
     return _sha(observation.commit.get("sha"))
 
 
+def _fix_agent_name(repo: str) -> str:
+    slug = safe_fragment(repo.rsplit("/", 1)[-1])
+    return f"ci_fix.{slug}.@"  # SASE replaces `@` with a concrete launch token.
+
+
 def _fix_prompt(repo: str, failure: FailureEvidence) -> str:
     slug = safe_fragment(repo.rsplit("/", 1)[-1])
     pr_name = f"ci_fix_{slug.replace('-', '_')}_{failure.sha[:7]}"
@@ -1174,6 +1182,95 @@ def _load_release_ledger(invocation: ChopInvocation, now: datetime) -> JsonObjec
 
 def _write_release_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> None:
     destination = Path(invocation.context.state_dir) / RELEASE_LEDGER_FILE_NAME
+    _atomic_write_json(destination, ledger)
+
+
+def _empty_fix_ledger() -> JsonObject:
+    return {"version": 1, "repos": {}, "announced": {}}
+
+
+def _fix_key_repo(value: str) -> str:
+    parts = value.split(":")
+    if (
+        len(parts) != 4
+        or parts[0] != "ci_fix"
+        or re.fullmatch(r"[0-9a-f]{16}", parts[2]) is None
+        or re.fullmatch(r"e(?:0|[1-9][0-9]*)", parts[3]) is None
+    ):
+        raise CiWatchError("invalid CI fix dedupe key")
+    return _repo(parts[1])
+
+
+def _prune_announced_fixes(
+    announced: Mapping[str, Any],
+    now: datetime,
+    repos: Sequence[str],
+) -> dict[str, str]:
+    allowed_repos = set(repos)
+    cutoff = now - timedelta(days=FIX_LEDGER_RETENTION_DAYS)
+    rows: list[tuple[datetime, str, str]] = []
+    for key, timestamp in announced.items():
+        if not isinstance(key, str) or not isinstance(timestamp, str):
+            continue
+        try:
+            repo = _fix_key_repo(key)
+            parsed = _parse_timestamp(timestamp).astimezone(now.tzinfo)
+        except (CiWatchError, ValueError):
+            continue
+        if repo not in allowed_repos or parsed < cutoff:
+            continue
+        rows.append((parsed, key, timestamp))
+    rows.sort(key=lambda row: (row[0], row[1]))
+    return {key: timestamp for _, key, timestamp in rows[-MAX_ANNOUNCED_FIXES:]}
+
+
+def _load_fix_ledger(
+    invocation: ChopInvocation,
+    now: datetime,
+    configured_repos: Sequence[str],
+) -> JsonObject:
+    path = Path(invocation.context.state_dir) / FIX_LEDGER_FILE_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _empty_fix_ledger()
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        return _empty_fix_ledger()
+    raw_repos = raw.get("repos")
+    raw_announced = raw.get("announced")
+    if not isinstance(raw_repos, dict) or not isinstance(raw_announced, dict):
+        return _empty_fix_ledger()
+
+    allowed_repos = set(configured_repos)
+    repos: dict[str, JsonObject] = {}
+    for repo, row in raw_repos.items():
+        if not isinstance(repo, str) or not isinstance(row, dict):
+            continue
+        episode = row.get("episode")
+        red = row.get("red")
+        try:
+            normalized_repo = _repo(repo)
+        except CiWatchError:
+            continue
+        if (
+            normalized_repo not in allowed_repos
+            or not isinstance(episode, int)
+            or isinstance(episode, bool)
+            or episode < 0
+            or not isinstance(red, bool)
+        ):
+            continue
+        repos[normalized_repo] = {"episode": episode, "red": red}
+
+    return {
+        "version": 1,
+        "repos": repos,
+        "announced": _prune_announced_fixes(raw_announced, now, configured_repos),
+    }
+
+
+def _write_fix_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> None:
+    destination = Path(invocation.context.state_dir) / FIX_LEDGER_FILE_NAME
     _atomic_write_json(destination, ledger)
 
 
@@ -1570,6 +1667,9 @@ def build_ci_watch_result(
     github = github or GitHubReader(config.gh_bin)
     agents = agents or AgentsGate(config.sase_bin)
     now = clock().astimezone()
+    fix_ledger = _load_fix_ledger(invocation, now, config.repos)
+    fix_repos = cast(dict[str, JsonObject], fix_ledger["repos"])
+    announced_fixes = cast(dict[str, str], fix_ledger["announced"])
     release_ledger = _load_release_ledger(invocation, now)
     release_merges = cast(list[JsonObject], release_ledger["merges"])
     announced_pending = cast(dict[str, JsonObject], release_ledger["announced_pending"])
@@ -1642,7 +1742,19 @@ def build_ci_watch_result(
     streaks = _load_streaks(invocation)
     mature_red_repos: list[str] = []
     for repo in config.repos:
-        if states[repo] is not RepoState.RED:
+        state = states[repo]
+        fix_row = fix_repos.setdefault(repo, {"episode": 0, "red": False})
+        episode = cast(int, fix_row["episode"])
+        was_red = cast(bool, fix_row["red"])
+        if state is RepoState.RED:
+            was_red = True
+        elif state is RepoState.GREEN and was_red:
+            episode += 1
+            was_red = False
+        fix_repos[repo] = {"episode": episode, "red": was_red}
+        _mark(ledger_repos, repo, fix_episode=episode)
+
+        if state is not RepoState.RED:
             streaks.pop(repo, None)
             continue
         failure = failures[repo]
@@ -1703,17 +1815,32 @@ def build_ci_watch_result(
                             continue
                         failure = failures[repo]
                         slug = safe_fragment(repo.rsplit("/", 1)[-1])
-                        dedupe_key = f"ci_fix:{repo}:{failure.fingerprint_key}"
+                        episode = cast(int, fix_repos[repo]["episode"])
+                        dedupe_key = f"ci_fix:{repo}:{failure.fingerprint_key}:e{episode}"
                         result_prompt = _fix_prompt(repo, failure)
                         counters["fix_proposed"] += 1
                         _mark(ledger_repos, repo, reason="fix_proposed")
-                        if not agents.notify(
-                            [f"Proposed a CI repair for {repo} at {failure.sha[:7]}"],
-                            tags=["ci"],
-                        ):
-                            ledger_repos[repo]["notification"] = "failed"
+                        if dedupe_key in announced_fixes:
+                            ledger_repos[repo]["notification"] = "already_announced"
+                        else:
+                            job_names = ", ".join(failure.failing_jobs[:3])
+                            remaining_jobs = len(failure.failing_jobs) - 3
+                            if remaining_jobs > 0:
+                                job_names = f"{job_names} (+{remaining_jobs} more)"
+                            notification_ok = agents.notify(
+                                [
+                                    f"Proposed a CI repair for {repo} at {failure.sha[:7]}",
+                                    _bounded(f"Failing jobs: {job_names}"),
+                                ],
+                                icon="🛠",
+                                tags=["ci"],
+                            )
+                            if notification_ok:
+                                announced_fixes[dedupe_key] = now.isoformat()
+                            else:
+                                ledger_repos[repo]["notification"] = "failed"
                         ledger_repos[repo]["proposal"] = {
-                            "agent_name": f"ci_fix.{slug}",
+                            "agent_name": _fix_agent_name(repo),
                             "dedupe_key": dedupe_key,
                         }
                         # Proposals are appended after the summary builder exists below.
@@ -1722,6 +1849,12 @@ def build_ci_watch_result(
                         streaks.pop(repo, None)
 
     _write_streaks(invocation, streaks)
+    announced_fixes = _prune_announced_fixes(announced_fixes, now, config.repos)
+    fix_ledger["announced"] = announced_fixes
+    try:
+        _write_fix_ledger(invocation, fix_ledger)
+    except OSError as error:
+        invocation.logger.warning(f"{CHOP_NAME}: fix ledger write skipped: {_bounded(error)}")
 
     release_observations: dict[str, ReleaseObservation] = {}
     remaining_details = MAX_RELEASE_PR_DETAILS
@@ -2058,7 +2191,7 @@ def build_ci_watch_result(
                 prompt,
                 f"gh:{repo}",
                 proposal_id=f"fix_{slug}",
-                agent_name=f"ci_fix.{slug}",
+                agent_name=_fix_agent_name(repo),
                 dedupe_key=dedupe_key,
             )
     ledger = {
@@ -2086,8 +2219,9 @@ Sweep SASE CI, propose non-overlapping repairs, and guard release merges.
 Terminal failing-job evidence stays actionable while unrelated work is in flight.
 A repair proposal is suppressed only while a live agent exists in the `ci_fix`
 hood; lane-level `wait_runners` controls launch-time machine idleness.
-A fixer landing either changes the failing job set or turns the repository green;
-either outcome resets the debounce streak and releases its SHA-independent key.
+Each failing-job set gets one repair proposal per red episode; an observed green
+resolution starts a new episode. Repair agents use the `ci_fix.<slug>.@` template so
+SASE assigns a concrete launch token.
 """.strip(),
         build_ci_watch_result,
     )

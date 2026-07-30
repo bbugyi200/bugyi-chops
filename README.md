@@ -20,8 +20,9 @@ and the final action lifecycle.
 `vars.merge_enabled` is true and `SASE_CHOP_DRY_RUN=0` is explicitly present, it may
 squash-merge one fully green release-please or release-plz PR. Missing or true dry-run
 context always suppresses merging. Its CI-fix proposals are emitted only after a
-global `sase agent list -j` probe reports zero live agents; the small race between that
-probe and Axe launching the proposal is accepted.
+`sase agent list -j` probe reports no live agent in the `ci_fix` hood. Proposed repair
+agents use the `ci_fix.<slug>.@` template so SASE assigns a unique launch token; the
+small race between the probe and Axe launching the proposal is accepted.
 
 ## Installation
 
