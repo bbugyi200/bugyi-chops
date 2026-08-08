@@ -2132,7 +2132,7 @@ def build_ci_watch_result(
                 f"{merged_today} merged today · {pending_count} pending",
             ],
             icon="🚢",
-            tags=["release"],
+            tags=["ci", "release"],
             action="ViewReport",
             action_data=release_action_data,
         ):
@@ -2147,7 +2147,7 @@ def build_ci_watch_result(
                 )
             ],
             icon="🚢",
-            tags=["release"],
+            tags=["ci", "release"],
             action="ViewReport",
             action_data=release_action_data,
         )

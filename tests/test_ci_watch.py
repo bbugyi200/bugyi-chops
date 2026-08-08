@@ -1199,7 +1199,7 @@ def test_live_merge_uses_dependency_order_and_cap(
                 "report_path": str((tmp_path / RELEASE_REPORT_FILE_NAME).resolve()),
                 "report_title": "Releases",
             },
-            "tags": ["release"],
+            "tags": ["ci", "release"],
         }
     ]
 
@@ -1476,6 +1476,7 @@ def test_blocked_release_notification_is_debounced_and_not_repeated(
         f"Release PR #10 for {REPO} needs attention: checks not green"
     ]
     assert agents.notifications[0]["action"] == "ViewReport"
+    assert agents.notifications[0]["tags"] == ["ci", "release"]
 
     github.numbers[REPO] = []
     _build(
@@ -1532,10 +1533,8 @@ def test_release_observation_failure_is_report_only_and_does_not_block_other_wor
     assert [plan.repo for plan in github.merges] == [CORE]
     assert ledger["repositories"][REPO]["reason"] == "fix_proposed"
     assert ledger["repositories"][REPO]["release_reason"] == "gh unavailable"
-    assert {notification["tags"][0] for notification in agents.notifications} == {
-        "ci",
-        "release",
-    }
+    assert {notification["tags"][0] for notification in agents.notifications} == {"ci"}
+    assert any(notification["tags"] == ["ci", "release"] for notification in agents.notifications)
     pending = _report_rows(
         _published_release_report(tmp_path),
         ["REPOSITORY", "PR", "STATE", "AGE"],
