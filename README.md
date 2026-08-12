@@ -6,21 +6,25 @@ scripts:
 
 | Script | What it proposes |
 | --- | --- |
-| `bugyi_chop_ci_watch` | Idle-gated CI repairs and explicitly enabled, guarded release merges |
+| `bugyi_chop_ci_watch` | LaunchApproval-gated CI repairs and explicitly enabled, guarded release merges |
 | `bugyi_chop_toobig_split` | One `%auto #split_file:<path>` agent per oversized Python file, chained in scan order |
 
-The scripts never launch agents themselves. They scan or assemble a prompt, then use
-the public `sase.chops` SDK to atomically write a validated result document. Axe owns
-guard and trigger evaluation, deduplication, workspace allocation, proposal launches,
-and the final action lifecycle.
+The scripts never launch agents themselves. `bugyi_chop_toobig_split` scans and
+assembles a prompt, then uses the public `sase.chops` SDK to atomically write a
+validated result document; Axe owns guard and trigger evaluation, deduplication,
+workspace allocation, proposal launches, and the final action lifecycle for that
+proposal. `bugyi_chop_ci_watch`'s CI-fix path instead files a durable LaunchApproval
+gate directly (see [`ci_watch` CI-fix gates](#ci_watch-ci-fix-gates) below); a human
+always approves or rejects it before any repair agent launches.
 
 `bugyi_chop_ci_watch` additionally owns a tightly guarded direct side effect: when
 `vars.merge_enabled` is true and `SASE_CHOP_DRY_RUN=0` is explicitly present, it may
 squash-merge one fully green release-please or release-plz PR. Missing or true dry-run
-context always suppresses merging. Its CI-fix proposals are emitted only after a
-`sase agent list -j` probe reports no live agent in the `ci_fix` hood. Proposed repair
-agents use the `ci_fix.<slug>.@` template so SASE assigns a unique launch token; the
-small race between the probe and Axe launching the proposal is accepted.
+context always suppresses merging. Its CI-fix gates are filed only when a
+`sase agent list -j` probe reports no live agent in the `ci_fix` hood, no earlier gate
+is still pending, and the current failing-job fingerprint has not already been gated
+for this red episode. Approved repair agents use the `ci_fix.<slug>.@` template so SASE
+assigns a unique launch token.
 
 ## Installation
 
@@ -66,7 +70,56 @@ launches anything, injects the workspace/name/tribe scaffold, honors `wait_on`
 dependencies, filters duplicate proposals, and tracks linked agents through
 `action_succeeded` or `action_failed`. The prompts here may use inline xprompts such
 as `#pr` and `#split_file`; they never use forbidden standalone `#!workflow`
-references.
+references. This proposal contract governs `bugyi_chop_toobig_split`.
+`bugyi_chop_ci_watch`'s CI-fix path never populates `proposed_launches`; it creates a
+LaunchApproval gate directly through `sase launch request` instead, so its result
+document always carries an empty proposal list.
+
+## `ci_watch` CI-fix gates
+
+Once a red repository's failing-job fingerprint has held for `red_debounce_ticks`
+ticks, `bugyi_chop_ci_watch` files a durable LaunchApproval gate instead of proposing a
+launch to Axe:
+
+```bash
+sase launch request -f <payload.json> -o json -s ci_watch
+```
+
+The gate kind is `launch` (`LaunchApproval`, `auto_policy: "forbidden"`), so approval is
+never automatic — a human must approve or reject the gate before any `ci_fix.<slug>.@`
+agent launches. Axe never scaffolds a LaunchApproval prompt the way it scaffolds a
+proposal, so the prompt itself is self-sufficient:
+
+```text
+#gh:<owner>/<repo> %i:ci_fix.<slug>.@ %w(runners=0)
+
+#pr(ci_fix_<slug>_<sha7>, status=ready)
+
+#actstat(repo=<owner>/<repo>)
+
+Repair the current default-branch CI failure in <owner>/<repo>.
+...
+```
+
+Each tick evaluates, in order, whether a new gate is suppressed — first match wins:
+
+1. `fix_enabled` is false → `fix_disabled`.
+2. The `sase agent list -j` probe fails → `agents_check_failed`.
+3. A live agent named `ci_fix` or `ci_fix.*` exists → `fix_in_flight`.
+4. Any gate recorded in the fix ledger is still `pending` → `gate_pending`. This is
+   global: while one CI-fix gate is unanswered, no new gate is filed for any repo.
+5. The candidate's dedupe key is already recorded in the ledger → `already_gated`.
+6. The per-tick cap `max_fix_proposals_per_tick` is reached → `fix_cap_reached`.
+7. Otherwise, the gate is created.
+
+The durable ledger (`ci_watch_fixes.json`, schema version 2) records each gate's
+request id under the dedupe key `ci_fix:{repo}:{failing_job_fingerprint}:e{episode}`,
+where `episode` increments only when a repository is observed going red and then green
+again. A key is recorded the instant its gate is created and is never re-gated: a
+rejected, cancelled, or timed-out gate does not come back, and only a genuinely new
+failure — a changed failing-job fingerprint or a new red episode — can produce another
+gate. The gate itself is the only user-facing signal for a CI-fix; no separate
+notification is sent.
 
 ## `toobig_split`
 

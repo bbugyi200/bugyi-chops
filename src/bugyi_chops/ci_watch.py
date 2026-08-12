@@ -48,7 +48,8 @@ MAX_HEAD_JOBS = 100
 MAX_HEAD_EVIDENCE_REPOS_PER_TICK = 10
 MAX_RELEASE_PR_DETAILS = 8
 MAX_LEDGER_MERGES = 50
-MAX_ANNOUNCED_FIXES = 100
+MAX_GATED_FIXES = 100
+MAX_GATE_POLLS_PER_TICK = 10
 MAX_TEXT = 240
 STREAK_FILE_NAME = "ci_watch_red_streaks.json"
 FIX_LEDGER_FILE_NAME = "ci_watch_fixes.json"
@@ -89,6 +90,7 @@ class CommandRunner(Protocol):
         argv: Sequence[str],
         *,
         input_text: str | None = None,
+        cwd: str | None = None,
     ) -> CommandResult: ...
 
 
@@ -96,6 +98,7 @@ def run_command(
     argv: Sequence[str],
     *,
     input_text: str | None = None,
+    cwd: str | None = None,
 ) -> CommandResult:
     try:
         completed = subprocess.run(
@@ -104,6 +107,7 @@ def run_command(
             capture_output=True,
             text=True,
             check=False,
+            cwd=cwd,
         )
     except OSError as error:
         raise CiWatchError(f"failed to execute {argv[0]}: {error}") from error
@@ -910,6 +914,73 @@ class AgentsGate:
         return result.returncode == 0
 
 
+GATE_STATUSES = frozenset({"pending", "answered", "cancelled", "timeout"})
+
+
+class LaunchGateClient:
+    """Create durable LaunchApproval gates and poll their status."""
+
+    def __init__(self, executable: str, runner: CommandRunner = run_command) -> None:
+        self.executable = executable
+        self._runner = runner
+
+    def create(self, payload: Mapping[str, Any]) -> str | None:
+        """Create a LaunchApproval request; return its request id if parseable.
+
+        Raises CiWatchError only when the command itself fails (non-zero exit
+        or exec failure). A successful exit with an unparsable descriptor
+        returns None so the caller can still record the dedupe key: the gate
+        may well have been created, and not duplicating it matters more than
+        being able to poll it.
+        """
+        fd, temp_name = tempfile.mkstemp(prefix=".ci-watch-launch-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(dict(payload), stream)
+            result = self._runner(
+                [
+                    self.executable,
+                    "launch",
+                    "request",
+                    "-f",
+                    temp_name,
+                    "-o",
+                    "json",
+                    "-s",
+                    CHOP_NAME,
+                ],
+                cwd=str(Path.home()),
+            )
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temp_name)
+        if result.returncode != 0:
+            detail = _bounded(result.stderr or result.stdout) or "-"
+            raise CiWatchError(
+                f"launch request failed: exit_code={result.returncode} detail={detail}"
+            )
+        try:
+            data = _json_object(result.stdout, source="launch request")
+        except CiWatchError:
+            return None
+        request_id = data.get("request_id")
+        return request_id if isinstance(request_id, str) and request_id.strip() else None
+
+    def status(self, request_id: str) -> str | None:
+        """Return a gate's status, or None if it cannot be read or parsed."""
+        result = self._runner(
+            [self.executable, "gate", "show", "-k", "launch", "-i", request_id, "-j"]
+        )
+        if result.returncode != 0:
+            return None
+        try:
+            data = _json_object(result.stdout, source="gate show")
+        except CiWatchError:
+            return None
+        value = data.get("status")
+        return value if isinstance(value, str) and value in GATE_STATUSES else None
+
+
 @dataclass(frozen=True)
 class Config:
     actstat_bin: str
@@ -1045,6 +1116,25 @@ outcome. Keep any fix narrowly scoped and run the relevant checks.
 """.strip()
 
 
+def _gate_prompt(repo: str, failure: FailureEvidence) -> str:
+    """Build the self-sufficient prompt a LaunchApproval gate previews.
+
+    A LaunchApproval prompt gets none of the workspace/agent-name/wait_runners
+    scaffolding Axe used to inject around a proposal, so the prompt itself must
+    carry all of it.
+    """
+    header = f"#gh:{repo} %i:{_fix_agent_name(repo)} %w(runners=0)"
+    return f"{header}\n\n{_fix_prompt(repo, failure)}"
+
+
+def _gate_reason(repo: str, failure: FailureEvidence) -> str:
+    job_names = ", ".join(failure.failing_jobs[:3])
+    remaining_jobs = len(failure.failing_jobs) - 3
+    if remaining_jobs > 0:
+        job_names = f"{job_names} (+{remaining_jobs} more)"
+    return _bounded(f"CI red in {repo} at {failure.sha[:7]}: {job_names}")
+
+
 def _dry_run_mode() -> str:
     value = os.getenv("SASE_CHOP_DRY_RUN")
     if value is None:
@@ -1063,9 +1153,11 @@ def _new_counters(repo_count: int) -> dict[str, int]:
         "pending": 0,
         "errors": 0,
         "agents_running": 0,
-        "fix_proposed": 0,
+        "fix_gated": 0,
         "fix_suppressed": 0,
         "red_debounce_suppressed": 0,
+        "gate_pending_suppressed": 0,
+        "gate_errors": 0,
         "release_candidates": 0,
         "merged": 0,
         "merge_skipped": 0,
@@ -1186,7 +1278,7 @@ def _write_release_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any])
 
 
 def _empty_fix_ledger() -> JsonObject:
-    return {"version": 1, "repos": {}, "announced": {}}
+    return {"version": 2, "repos": {}, "gates": {}}
 
 
 def _fix_key_repo(value: str) -> str:
@@ -1201,27 +1293,33 @@ def _fix_key_repo(value: str) -> str:
     return _repo(parts[1])
 
 
-def _prune_announced_fixes(
-    announced: Mapping[str, Any],
+def _prune_gated_fixes(
+    gates: Mapping[str, Any],
     now: datetime,
     repos: Sequence[str],
-) -> dict[str, str]:
+) -> dict[str, JsonObject]:
     allowed_repos = set(repos)
     cutoff = now - timedelta(days=FIX_LEDGER_RETENTION_DAYS)
-    rows: list[tuple[datetime, str, str]] = []
-    for key, timestamp in announced.items():
-        if not isinstance(key, str) or not isinstance(timestamp, str):
+    rows: list[tuple[datetime, str, JsonObject]] = []
+    for key, row in gates.items():
+        if not isinstance(key, str) or not isinstance(row, dict):
+            continue
+        request_id = row.get("request_id")
+        created_at = row.get("created_at")
+        if (request_id is not None and not isinstance(request_id, str)) or not isinstance(
+            created_at, str
+        ):
             continue
         try:
             repo = _fix_key_repo(key)
-            parsed = _parse_timestamp(timestamp).astimezone(now.tzinfo)
+            parsed = _parse_timestamp(created_at).astimezone(now.tzinfo)
         except (CiWatchError, ValueError):
             continue
         if repo not in allowed_repos or parsed < cutoff:
             continue
-        rows.append((parsed, key, timestamp))
+        rows.append((parsed, key, {"request_id": request_id, "created_at": created_at}))
     rows.sort(key=lambda row: (row[0], row[1]))
-    return {key: timestamp for _, key, timestamp in rows[-MAX_ANNOUNCED_FIXES:]}
+    return {key: row for _, key, row in rows[-MAX_GATED_FIXES:]}
 
 
 def _load_fix_ledger(
@@ -1234,11 +1332,11 @@ def _load_fix_ledger(
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return _empty_fix_ledger()
-    if not isinstance(raw, dict) or raw.get("version") != 1:
+    if not isinstance(raw, dict) or raw.get("version") != 2:
         return _empty_fix_ledger()
     raw_repos = raw.get("repos")
-    raw_announced = raw.get("announced")
-    if not isinstance(raw_repos, dict) or not isinstance(raw_announced, dict):
+    raw_gates = raw.get("gates")
+    if not isinstance(raw_repos, dict) or not isinstance(raw_gates, dict):
         return _empty_fix_ledger()
 
     allowed_repos = set(configured_repos)
@@ -1263,9 +1361,9 @@ def _load_fix_ledger(
         repos[normalized_repo] = {"episode": episode, "red": red}
 
     return {
-        "version": 1,
+        "version": 2,
         "repos": repos,
-        "announced": _prune_announced_fixes(raw_announced, now, configured_repos),
+        "gates": _prune_gated_fixes(raw_gates, now, configured_repos),
     }
 
 
@@ -1372,6 +1470,9 @@ def _repo_evidence(
         "fix_cap_reached",
         "fix_disabled",
         "agents_check_failed",
+        "gate_pending",
+        "already_gated",
+        "gate_failed",
     }:
         return reason
     if state is RepoState.GREEN and repo in heads:
@@ -1654,22 +1755,39 @@ def _build_ci_watch_report(
     return report
 
 
+def _any_gate_pending(launch_gate: LaunchGateClient, gates: Mapping[str, JsonObject]) -> bool:
+    """Return whether any recorded gate is still pending, bounding the polling work."""
+    checked = 0
+    for row in gates.values():
+        if checked >= MAX_GATE_POLLS_PER_TICK:
+            break
+        request_id = row.get("request_id")
+        if not isinstance(request_id, str) or not request_id.strip():
+            continue
+        checked += 1
+        if launch_gate.status(request_id) == "pending":
+            return True
+    return False
+
+
 def build_ci_watch_result(
     invocation: ChopInvocation,
     *,
     actstat: ActstatClient | None = None,
     github: GitHubReader | None = None,
     agents: AgentsGate | None = None,
+    launch_gate: LaunchGateClient | None = None,
     clock: Callable[[], datetime] = _local_now,
 ) -> ChopResultBuilder:
     config = Config.from_invocation(invocation)
     actstat = actstat or ActstatClient(config.actstat_bin)
     github = github or GitHubReader(config.gh_bin)
     agents = agents or AgentsGate(config.sase_bin)
+    launch_gate = launch_gate or LaunchGateClient(config.sase_bin)
     now = clock().astimezone()
     fix_ledger = _load_fix_ledger(invocation, now, config.repos)
     fix_repos = cast(dict[str, JsonObject], fix_ledger["repos"])
-    announced_fixes = cast(dict[str, str], fix_ledger["announced"])
+    fix_gates = cast(dict[str, JsonObject], fix_ledger["gates"])
     release_ledger = _load_release_ledger(invocation, now)
     release_merges = cast(list[JsonObject], release_ledger["merges"])
     announced_pending = cast(dict[str, JsonObject], release_ledger["announced_pending"])
@@ -1807,50 +1925,62 @@ def build_ci_watch_result(
                             reason="fix_in_flight",
                             in_flight_agents=in_flight_names,
                         )
+                elif _any_gate_pending(launch_gate, fix_gates):
+                    for repo in mature_red_repos:
+                        counters["fix_suppressed"] += 1
+                        counters["gate_pending_suppressed"] += 1
+                        _mark(ledger_repos, repo, reason="gate_pending")
                 else:
-                    for index, repo in enumerate(mature_red_repos):
-                        if index >= config.max_fixes:
+                    gate_attempts = 0
+                    for repo in mature_red_repos:
+                        failure = failures[repo]
+                        episode = cast(int, fix_repos[repo]["episode"])
+                        dedupe_key = f"ci_fix:{repo}:{failure.fingerprint_key}:e{episode}"
+                        if dedupe_key in fix_gates:
+                            counters["fix_suppressed"] += 1
+                            _mark(ledger_repos, repo, reason="already_gated")
+                            continue
+                        if gate_attempts >= config.max_fixes:
                             counters["fix_suppressed"] += 1
                             _mark(ledger_repos, repo, reason="fix_cap_reached")
                             continue
-                        failure = failures[repo]
-                        slug = safe_fragment(repo.rsplit("/", 1)[-1])
-                        episode = cast(int, fix_repos[repo]["episode"])
-                        dedupe_key = f"ci_fix:{repo}:{failure.fingerprint_key}:e{episode}"
-                        result_prompt = _fix_prompt(repo, failure)
-                        counters["fix_proposed"] += 1
-                        _mark(ledger_repos, repo, reason="fix_proposed")
-                        if dedupe_key in announced_fixes:
-                            ledger_repos[repo]["notification"] = "already_announced"
-                        else:
-                            job_names = ", ".join(failure.failing_jobs[:3])
-                            remaining_jobs = len(failure.failing_jobs) - 3
-                            if remaining_jobs > 0:
-                                job_names = f"{job_names} (+{remaining_jobs} more)"
-                            notification_ok = agents.notify(
-                                [
-                                    f"Proposed a CI repair for {repo} at {failure.sha[:7]}",
-                                    _bounded(f"Failing jobs: {job_names}"),
-                                ],
-                                icon="🛠",
-                                tags=["ci"],
+                        gate_attempts += 1
+                        payload = {
+                            "schema_version": 1,
+                            "prompt": _gate_prompt(repo, failure),
+                            "reason": _gate_reason(repo, failure),
+                            "approval": "required",
+                            "max_slots": 1,
+                        }
+                        try:
+                            request_id = launch_gate.create(payload)
+                        except CiWatchError as error:
+                            counters["gate_errors"] += 1
+                            _mark(ledger_repos, repo, reason="gate_failed")
+                            ledger_repos[repo]["gate_error"] = _bounded(error)
+                            continue
+                        fix_gates[dedupe_key] = {
+                            "request_id": request_id,
+                            "created_at": now.isoformat(),
+                        }
+                        fix_ledger["gates"] = fix_gates
+                        try:
+                            _write_fix_ledger(invocation, fix_ledger)
+                        except OSError as error:
+                            invocation.logger.warning(
+                                f"{CHOP_NAME}: fix ledger write skipped: {_bounded(error)}"
                             )
-                            if notification_ok:
-                                announced_fixes[dedupe_key] = now.isoformat()
-                            else:
-                                ledger_repos[repo]["notification"] = "failed"
-                        ledger_repos[repo]["proposal"] = {
+                        counters["fix_gated"] += 1
+                        _mark(ledger_repos, repo, reason="fix_gated")
+                        ledger_repos[repo]["gate"] = {
                             "agent_name": _fix_agent_name(repo),
                             "dedupe_key": dedupe_key,
+                            "request_id": request_id,
                         }
-                        # Proposals are appended after the summary builder exists below.
-                        ledger_repos[repo]["_prompt"] = result_prompt
-                        ledger_repos[repo]["_dedupe_key"] = dedupe_key
                         streaks.pop(repo, None)
 
     _write_streaks(invocation, streaks)
-    announced_fixes = _prune_announced_fixes(announced_fixes, now, config.repos)
-    fix_ledger["announced"] = announced_fixes
+    fix_ledger["gates"] = _prune_gated_fixes(fix_gates, now, config.repos)
     try:
         _write_fix_ledger(invocation, fix_ledger)
     except OSError as error:
@@ -2164,7 +2294,7 @@ def build_ci_watch_result(
                 f"{CHOP_NAME}: pending notification ledger write skipped: {_bounded(error)}"
             )
 
-    actionable = bool(counters["fix_proposed"] or counters["merged"])
+    actionable = bool(counters["fix_gated"] or counters["merged"])
     result = result_with_summary(
         invocation,
         CHOP_NAME,
@@ -2182,18 +2312,6 @@ def build_ci_watch_result(
             mode,
         ),
     )
-    for repo in mature_red_repos:
-        prompt = ledger_repos[repo].pop("_prompt", None)
-        dedupe_key = ledger_repos[repo].pop("_dedupe_key", None)
-        if isinstance(prompt, str) and isinstance(dedupe_key, str):
-            slug = safe_fragment(repo.rsplit("/", 1)[-1])
-            result.propose(
-                prompt,
-                f"gh:{repo}",
-                proposal_id=f"fix_{slug}",
-                agent_name=_fix_agent_name(repo),
-                dedupe_key=dedupe_key,
-            )
     ledger = {
         "mode": mode,
         "repositories": ledger_repos,
@@ -2214,14 +2332,18 @@ def main() -> None:
     run_chop(
         CHOP_NAME,
         """\
-Sweep SASE CI, propose non-overlapping repairs, and guard release merges.
+Sweep SASE CI, gate non-overlapping repairs behind LaunchApproval, and guard
+release merges.
 
 Terminal failing-job evidence stays actionable while unrelated work is in flight.
-A repair proposal is suppressed only while a live agent exists in the `ci_fix`
-hood; lane-level `wait_runners` controls launch-time machine idleness.
-Each failing-job set gets one repair proposal per red episode; an observed green
-resolution starts a new episode. Repair agents use the `ci_fix.<slug>.@` template so
-SASE assigns a concrete launch token.
+A mature red failure files one durable LaunchApproval gate; approval is never
+automatic. A new gate is suppressed while a live agent exists in the `ci_fix`
+hood, while an earlier gate is still unanswered, or once the same failing-job
+fingerprint has already been gated for the current red episode. Each failing-job
+set gets one gate per red episode; an observed green resolution starts a new
+episode. Repair agents use the `ci_fix.<slug>.@` template so SASE assigns a
+concrete launch token, and the gate prompt carries `%w(runners=0)` since Axe no
+longer applies lane-level `wait_runners` to a launch it did not itself propose.
 """.strip(),
         build_ci_watch_result,
     )

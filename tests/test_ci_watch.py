@@ -15,7 +15,8 @@ import bugyi_chops.ci_watch as ci_watch_module
 from bugyi_chops.ci_watch import (
     FIX_LEDGER_FILE_NAME,
     FIX_LEDGER_RETENTION_DAYS,
-    MAX_ANNOUNCED_FIXES,
+    MAX_GATE_POLLS_PER_TICK,
+    MAX_GATED_FIXES,
     MAX_LEDGER_MERGES,
     MAX_LEDGER_NAMES,
     RELEASE_LEDGER_FILE_NAME,
@@ -29,6 +30,7 @@ from bugyi_chops.ci_watch import (
     Config,
     GitHubReader,
     HeadCiEvidence,
+    LaunchGateClient,
     MergePlan,
     ReleasePr,
     RepoObservation,
@@ -265,6 +267,36 @@ class FakeAgents:
         return self.notify_ok
 
 
+class FakeLaunchGate:
+    def __init__(
+        self,
+        *,
+        request_ids: Sequence[str | None] | None = None,
+        create_error: str | None = None,
+        statuses: dict[str, str] | None = None,
+    ) -> None:
+        self._request_ids = list(request_ids) if request_ids is not None else None
+        self._counter = 0
+        self.create_error = create_error
+        self.statuses = dict(statuses or {})
+        self.payloads: list[dict[str, Any]] = []
+        self.status_calls: list[str] = []
+
+    def create(self, payload: dict[str, Any]) -> str | None:
+        self.payloads.append(dict(payload))
+        if self.create_error is not None:
+            raise CiWatchError(self.create_error)
+        self._counter += 1
+        if self._request_ids is not None:
+            index = self._counter - 1
+            return self._request_ids[index] if index < len(self._request_ids) else None
+        return f"launch-{self._counter}"
+
+    def status(self, request_id: str) -> str | None:
+        self.status_calls.append(request_id)
+        return self.statuses.get(request_id)
+
+
 def _vars(
     *,
     repos: Sequence[str] = (REPO, CORE),
@@ -318,17 +350,20 @@ def _build(
     *,
     github: FakeGitHub | None = None,
     agents: FakeAgents | None = None,
+    launch_gate: FakeLaunchGate | None = None,
     variables: dict[str, Any] | None = None,
     result_file: str = "result.json",
     clock: Callable[[], datetime] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], FakeGitHub, FakeAgents]:
     github = github or FakeGitHub()
     agents = agents or FakeAgents()
+    launch_gate = launch_gate or FakeLaunchGate()
     result = build_ci_watch_result(
         _invocation(tmp_path, variables or _vars(), result_file=result_file),
         actstat=FakeActstat(observations),  # type: ignore[arg-type]
         github=github,  # type: ignore[arg-type]
         agents=agents,  # type: ignore[arg-type]
+        launch_gate=launch_gate,  # type: ignore[arg-type]
         **({"clock": clock} if clock is not None else {}),
     ).to_dict()
     evidence = result["evidence"]
@@ -352,9 +387,11 @@ def test_all_green_without_release_prs_is_noop(tmp_path: Path) -> None:
         "pending": 0,
         "errors": 0,
         "agents_running": 0,
-        "fix_proposed": 0,
+        "fix_gated": 0,
         "fix_suppressed": 0,
         "red_debounce_suppressed": 0,
+        "gate_pending_suppressed": 0,
+        "gate_errors": 0,
         "release_candidates": 0,
         "merged": 0,
         "merge_skipped": 0,
@@ -430,68 +467,83 @@ def test_ledger_file_is_unique_per_result_file(tmp_path: Path) -> None:
     assert (tmp_path / "tick-one.decisions.json").is_file()
     assert (tmp_path / "tick-two.decisions.json").is_file()
     assert first_ledger["repositories"][CORE]["reason"] == "green"
-    assert second_ledger["repositories"][CORE]["reason"] == "fix_proposed"
+    assert second_ledger["repositories"][CORE]["reason"] == "fix_gated"
 
 
-def test_red_idle_emits_one_pinned_sanitized_proposal(tmp_path: Path) -> None:
-    agents = FakeAgents(notify_ok=False)
+def test_red_idle_files_one_pinned_sanitized_gate(tmp_path: Path) -> None:
+    agents = FakeAgents()
+    launch_gate = FakeLaunchGate()
     observations = _observations(red=(REPO,), active=(REPO,))
     result, ledger, _, agents = _build(
         tmp_path,
         observations,
         agents=agents,
+        launch_gate=launch_gate,
     )
 
     assert result["status"] == "ok"
-    assert result["counters"]["fix_proposed"] == 1
-    proposal = result["proposed_launches"][0]
-    assert proposal["workspace"] == f"gh:{REPO}"
-    assert proposal["agent_name"] == "ci_fix.sase.@"
-    assert proposal["agent_name"] != "ci_fix.sase"
-    assert proposal["dedupe_key"] == ledger["repositories"][REPO]["proposal"]["dedupe_key"]
-    assert SHA not in proposal["dedupe_key"]
-    assert "#pr(ci_fix_sase_aaaaaaa, status=ready)" in proposal["prompt"]
-    assert f"#actstat(repo={REPO})" in proposal["prompt"]
-    assert SHA in proposal["prompt"]
-    assert "token=do-not-leak" not in proposal["prompt"]
-    assert "[redacted]" in proposal["prompt"]
-    assert agents.notifications[0]["icon"] == "🛠"
-    assert agents.notifications[0]["tags"] == ["ci"]
-    assert agents.notifications[0]["notes"][1].startswith("Failing jobs:")
-    assert ledger["repositories"][REPO]["notification"] == "failed"
+    assert result["counters"]["fix_gated"] == 1
+    assert result["proposed_launches"] == []
+    assert agents.notifications == []
+    assert len(launch_gate.payloads) == 1
+    payload = launch_gate.payloads[0]
+    assert payload["schema_version"] == 1
+    assert payload["approval"] == "required"
+    assert payload["max_slots"] == 1
+    assert REPO in payload["reason"]
+    assert SHA[:7] in payload["reason"]
+    prompt = payload["prompt"]
+    assert prompt.startswith(f"#gh:{REPO} %i:ci_fix.sase.@ %w(runners=0)")
+    assert "#pr(ci_fix_sase_aaaaaaa, status=ready)" in prompt
+    assert f"#actstat(repo={REPO})" in prompt
+    assert SHA in prompt
+    assert "token=do-not-leak" not in prompt
+    assert "[redacted]" in prompt
+    gate = ledger["repositories"][REPO]["gate"]
+    assert gate["agent_name"] == "ci_fix.sase.@"
+    assert gate["agent_name"] != "ci_fix.sase"
+    assert gate["request_id"] == "launch-1"
+    dedupe_key = gate["dedupe_key"]
+    assert SHA not in dedupe_key
     assert "token=" not in json.dumps(ledger).lower()
     fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
-    assert fix_ledger["announced"] == {}
+    assert fix_ledger["version"] == 2
+    assert fix_ledger["gates"][dedupe_key]["request_id"] == "launch-1"
 
 
-def test_unrelated_agents_do_not_block_fixes_and_proposals_are_capped(
+def test_unrelated_agents_do_not_block_fixes_and_gates_are_capped(
     tmp_path: Path,
 ) -> None:
+    launch_gate = FakeLaunchGate()
     observations = _observations(red=(REPO, CORE))
     result, ledger, _, _ = _build(
         tmp_path,
         observations,
         agents=FakeAgents(["interactive", "toobig-worker", "audit.waiting"]),
+        launch_gate=launch_gate,
     )
 
     assert result["counters"]["agents_running"] == 3
-    assert result["counters"]["fix_proposed"] == 1
+    assert result["counters"]["fix_gated"] == 1
     assert result["counters"]["fix_suppressed"] == 1
-    assert [item["workspace"] for item in result["proposed_launches"]] == [f"gh:{REPO}"]
-    assert ledger["repositories"][REPO]["reason"] == "fix_proposed"
+    assert len(launch_gate.payloads) == 1
+    assert ledger["repositories"][REPO]["reason"] == "fix_gated"
     assert ledger["repositories"][CORE]["reason"] == "fix_cap_reached"
 
 
 def test_live_ci_fix_agent_suppresses_all_mature_red_repos(tmp_path: Path) -> None:
+    launch_gate = FakeLaunchGate()
     result, ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO, CORE)),
         agents=FakeAgents(["interactive", "ci_fix.sase"]),
+        launch_gate=launch_gate,
     )
 
     assert result["counters"]["agents_running"] == 2
     assert result["counters"]["fix_suppressed"] == 2
     assert result["proposed_launches"] == []
+    assert launch_gate.payloads == []
     assert ledger["repositories"][REPO]["reason"] == "fix_in_flight"
     assert ledger["repositories"][CORE]["in_flight_agents"] == ["ci_fix.sase"]
 
@@ -502,8 +554,8 @@ def test_live_ci_fix_agent_suppresses_all_mature_red_repos(tmp_path: Path) -> No
         (("ci_fix",), "fix_in_flight"),
         (("ci_fix.sase",), "fix_in_flight"),
         (("ci_fix.sase.child",), "fix_in_flight"),
-        (("ci_fixer",), "fix_proposed"),
-        (("ci_fixing.sase",), "fix_proposed"),
+        (("ci_fixer",), "fix_gated"),
+        (("ci_fixing.sase",), "fix_gated"),
     ],
 )
 def test_ci_fix_hood_matching(
@@ -511,14 +563,17 @@ def test_ci_fix_hood_matching(
     agent_names: tuple[str, ...],
     expected_reason: str,
 ) -> None:
+    launch_gate = FakeLaunchGate()
     result, ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO,)),
         agents=FakeAgents(agent_names),
+        launch_gate=launch_gate,
     )
 
     assert ledger["repositories"][REPO]["reason"] == expected_reason
-    assert bool(result["proposed_launches"]) is (expected_reason == "fix_proposed")
+    assert bool(launch_gate.payloads) is (expected_reason == "fix_gated")
+    assert result["proposed_launches"] == []
 
 
 def test_ci_fix_ledger_names_are_bounded_and_redacted(tmp_path: Path) -> None:
@@ -630,7 +685,7 @@ def test_pending_and_error_classification_is_fail_closed(
     counter_name = "errors" if expected_state == "error" else expected_state
     assert result["counters"][counter_name] >= 1
     assert ledger["repositories"][REPO]["reason"] == expected_reason
-    assert all(item["workspace"] != f"gh:{REPO}" for item in result["proposed_launches"])
+    assert result["proposed_launches"] == []
 
 
 def test_older_red_stays_actionable_while_head_is_unsettled(tmp_path: Path) -> None:
@@ -638,18 +693,20 @@ def test_older_red_stays_actionable_while_head_is_unsettled(tmp_path: Path) -> N
     github = FakeGitHub()
     github.heads[REPO] = BranchHead("master", new_head)
     github.head_evidence[REPO] = _head_evidence(new_head, in_flight=True)
+    launch_gate = FakeLaunchGate()
 
     result, ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO,), active=(REPO,)),
         github=github,
+        launch_gate=launch_gate,
     )
 
     assert result["counters"]["red"] == 1
-    proposal = result["proposed_launches"][0]
-    assert f"Pinned failing commit: {SHA[:7]}" in proposal["prompt"]
-    assert new_head in proposal["prompt"]
-    assert "older than the current unsettled HEAD" in proposal["prompt"]
+    prompt = launch_gate.payloads[0]["prompt"]
+    assert f"Pinned failing commit: {SHA[:7]}" in prompt
+    assert new_head in prompt
+    assert "older than the current unsettled HEAD" in prompt
     assert ledger["repositories"][REPO]["classification_reason"] == "head_unsettled"
     assert ledger["repositories"][REPO]["head_unsettled"] is True
 
@@ -662,16 +719,18 @@ def test_newer_head_red_evidence_takes_precedence(tmp_path: Path) -> None:
         new_head,
         failing_jobs=("new failing job",),
     )
+    launch_gate = FakeLaunchGate()
 
-    result, ledger, _, _ = _build(
+    _, ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO,)),
         github=github,
+        launch_gate=launch_gate,
     )
 
-    proposal = result["proposed_launches"][0]
-    assert f"Pinned failing commit: {new_head}" in proposal["prompt"]
-    assert "new failing job" in proposal["prompt"]
+    prompt = launch_gate.payloads[0]["prompt"]
+    assert f"Pinned failing commit: {new_head}" in prompt
+    assert "new failing job" in prompt
     assert ledger["repositories"][REPO]["failing_jobs"] == ["new failing job"]
 
 
@@ -789,22 +848,25 @@ def test_red_debounce_persists_and_resets_on_changed_fingerprint(
     tmp_path: Path,
 ) -> None:
     variables = _vars(red_debounce_ticks=2)
+    launch_gate = FakeLaunchGate()
     first, first_ledger, _, first_agents = _build(
         tmp_path,
         _observations(red=(REPO,)),
         variables=variables,
+        launch_gate=launch_gate,
     )
-    second, second_ledger, _, second_agents = _build(
+    _, second_ledger, _, second_agents = _build(
         tmp_path,
         _observations(red=(REPO,)),
         variables=variables,
+        launch_gate=launch_gate,
     )
 
     assert first["proposed_launches"] == []
     assert first["counters"]["red_debounce_suppressed"] == 1
     assert first_ledger["repositories"][REPO]["reason"] == "red_debounce"
     assert first_agents.probes == 0
-    assert len(second["proposed_launches"]) == 1
+    assert len(launch_gate.payloads) == 1
     assert second_ledger["repositories"][REPO]["streak"] == 2
     assert second_agents.probes == 1
 
@@ -857,7 +919,8 @@ def test_intervening_green_and_corrupt_streak_reset_debounce(tmp_path: Path) -> 
 
 
 def test_dedupe_key_is_stable_across_head_shas(tmp_path: Path) -> None:
-    first, _, _, _ = _build(tmp_path, _observations(red=(REPO,)))
+    launch_gate = FakeLaunchGate()
+    _, first_ledger, _, _ = _build(tmp_path, _observations(red=(REPO,)), launch_gate=launch_gate)
     new_sha = "c" * 40
     observations = _observations()
     observations[REPO] = RepoObservation(
@@ -866,39 +929,46 @@ def test_dedupe_key_is_stable_across_head_shas(tmp_path: Path) -> None:
     )
     github = FakeGitHub()
     github.heads[REPO] = BranchHead("master", new_sha)
-    second, _, _, _ = _build(tmp_path, observations, github=github)
+    _, second_ledger, _, _ = _build(tmp_path, observations, github=github, launch_gate=launch_gate)
 
-    assert (
-        first["proposed_launches"][0]["dedupe_key"] == second["proposed_launches"][0]["dedupe_key"]
-    )
+    assert first_ledger["repositories"][REPO]["reason"] == "fix_gated"
+    assert second_ledger["repositories"][REPO]["reason"] == "already_gated"
+    assert len(launch_gate.payloads) == 1
 
 
 def test_green_starts_a_new_fix_episode(tmp_path: Path) -> None:
+    first_launch_gate = FakeLaunchGate()
     first, first_ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO,)),
         clock=_clock_at(FIXED_NOW),
+        launch_gate=first_launch_gate,
     )
     _, green_ledger, _, _ = _build(
         tmp_path,
         _observations(),
         clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
     )
+    second_launch_gate = FakeLaunchGate()
     second, second_ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO,)),
         clock=_clock_at(FIXED_NOW + timedelta(minutes=10)),
+        launch_gate=second_launch_gate,
     )
 
-    first_key = first["proposed_launches"][0]["dedupe_key"]
-    second_key = second["proposed_launches"][0]["dedupe_key"]
+    first_key = first_ledger["repositories"][REPO]["gate"]["dedupe_key"]
+    second_key = second_ledger["repositories"][REPO]["gate"]["dedupe_key"]
     assert first_key.endswith(":e0")
     assert second_key.endswith(":e1")
     assert first_key != second_key
     assert first_ledger["repositories"][REPO]["fix_episode"] == 0
     assert green_ledger["repositories"][REPO]["fix_episode"] == 1
     assert second_ledger["repositories"][REPO]["fix_episode"] == 1
+    assert first["counters"]["fix_gated"] == 1
+    assert second["counters"]["fix_gated"] == 1
     fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
+    assert fix_ledger["version"] == 2
     assert fix_ledger["repos"][REPO] == {"episode": 1, "red": True}
 
 
@@ -907,7 +977,8 @@ def test_unsettled_state_does_not_start_a_new_fix_episode(
     tmp_path: Path,
     middle_state: str,
 ) -> None:
-    first, _, _, _ = _build(tmp_path, _observations(red=(REPO,)))
+    launch_gate = FakeLaunchGate()
+    _, first_ledger, _, _ = _build(tmp_path, _observations(red=(REPO,)), launch_gate=launch_gate)
     observations = _observations()
     github = FakeGitHub()
     if middle_state == "pending":
@@ -919,101 +990,211 @@ def test_unsettled_state_does_not_start_a_new_fix_episode(
         observations[REPO] = RepoObservation(REPO, error="missing_observation")
         github.workflow_counts[REPO] = 0
     _, middle_ledger, _, _ = _build(tmp_path, observations, github=github)
-    second, second_ledger, _, _ = _build(tmp_path, _observations(red=(REPO,)))
+    _, second_ledger, _, _ = _build(tmp_path, _observations(red=(REPO,)), launch_gate=launch_gate)
 
     assert middle_ledger["repositories"][REPO]["state"] == middle_state
     assert middle_ledger["repositories"][REPO]["fix_episode"] == 0
     assert second_ledger["repositories"][REPO]["fix_episode"] == 0
-    assert (
-        first["proposed_launches"][0]["dedupe_key"] == second["proposed_launches"][0]["dedupe_key"]
-    )
+    assert first_ledger["repositories"][REPO]["reason"] == "fix_gated"
+    assert second_ledger["repositories"][REPO]["reason"] == "already_gated"
+    assert len(launch_gate.payloads) == 1
 
 
-def test_fix_notification_is_sent_once_without_suppressing_proposal(
-    tmp_path: Path,
-) -> None:
-    agents = FakeAgents()
-    first, _, _, _ = _build(
+def test_pending_gate_suppresses_a_different_red_repo(tmp_path: Path) -> None:
+    launch_gate = FakeLaunchGate(statuses={"launch-1": "pending"})
+    _, first_ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO,)),
-        agents=agents,
-        clock=_clock_at(FIXED_NOW),
+        launch_gate=launch_gate,
     )
+    assert first_ledger["repositories"][REPO]["reason"] == "fix_gated"
+
     second, second_ledger, _, _ = _build(
         tmp_path,
-        _observations(red=(REPO,)),
-        agents=agents,
-        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+        _observations(red=(CORE,)),
+        launch_gate=launch_gate,
     )
 
-    assert len(agents.notifications) == 1
-    assert len(first["proposed_launches"]) == 1
-    assert len(second["proposed_launches"]) == 1
-    assert second_ledger["repositories"][REPO]["notification"] == "already_announced"
+    assert second["counters"]["gate_pending_suppressed"] == 1
+    assert second_ledger["repositories"][CORE]["reason"] == "gate_pending"
+    assert len(launch_gate.payloads) == 1
+    assert launch_gate.status_calls == ["launch-1"]
 
 
-def test_failed_fix_notification_is_retried(tmp_path: Path) -> None:
-    first_agents = FakeAgents(notify_ok=False)
-    _build(
+@pytest.mark.parametrize("terminal_status", ["answered", "cancelled", "timeout"])
+def test_terminal_gate_status_does_not_resurrect_dedupe_key(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    launch_gate = FakeLaunchGate(statuses={"launch-1": terminal_status})
+    _, first_ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO,)),
-        agents=first_agents,
-        clock=_clock_at(FIXED_NOW),
+        launch_gate=launch_gate,
     )
-    fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
-    assert fix_ledger["announced"] == {}
+    assert first_ledger["repositories"][REPO]["reason"] == "fix_gated"
 
-    second_agents = FakeAgents()
     _, second_ledger, _, _ = _build(
         tmp_path,
         _observations(red=(REPO,)),
-        agents=second_agents,
-        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+        launch_gate=launch_gate,
     )
 
-    assert len(first_agents.notifications) == 1
-    assert len(second_agents.notifications) == 1
-    assert "notification" not in second_ledger["repositories"][REPO]
+    assert second_ledger["repositories"][REPO]["reason"] == "already_gated"
+    assert len(launch_gate.payloads) == 1
+
+
+def test_gate_pending_probe_is_bounded_per_tick(tmp_path: Path) -> None:
+    launch_gate = FakeLaunchGate()
+    gates = {
+        f"ci_fix:{REPO}:{index:016x}:e0": {
+            "request_id": f"launch-{index}",
+            "created_at": FIXED_NOW.isoformat(),
+        }
+        for index in range(MAX_GATE_POLLS_PER_TICK + 5)
+    }
+    (tmp_path / FIX_LEDGER_FILE_NAME).write_text(
+        json.dumps({"version": 2, "repos": {}, "gates": gates}),
+        encoding="utf-8",
+    )
+
+    _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        launch_gate=launch_gate,
+        clock=_clock_at(FIXED_NOW),
+    )
+
+    assert len(launch_gate.status_calls) == MAX_GATE_POLLS_PER_TICK
+
+
+def test_gate_creation_failure_counts_errors_and_leaves_key_unrecorded(
+    tmp_path: Path,
+) -> None:
+    launch_gate = FakeLaunchGate(create_error="exit_code=2 detail=boom")
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        launch_gate=launch_gate,
+    )
+
+    assert result["status"] == "no_op"
+    assert result["counters"]["gate_errors"] == 1
+    assert result["counters"]["fix_gated"] == 0
+    assert ledger["repositories"][REPO]["reason"] == "gate_failed"
+    assert "boom" in ledger["repositories"][REPO]["gate_error"]
     fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
-    assert len(fix_ledger["announced"]) == 1
+    assert fix_ledger["gates"] == {}
+
+    retry_gate = FakeLaunchGate()
+    retry_result, retry_ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        launch_gate=retry_gate,
+    )
+    assert retry_result["counters"]["fix_gated"] == 1
+    assert retry_ledger["repositories"][REPO]["reason"] == "fix_gated"
+
+
+def test_gate_with_unparsable_descriptor_still_records_dedupe_key(tmp_path: Path) -> None:
+    launch_gate = FakeLaunchGate(request_ids=[None])
+    result, ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        launch_gate=launch_gate,
+    )
+
+    assert result["counters"]["fix_gated"] == 1
+    assert result["counters"]["gate_errors"] == 0
+    gate = ledger["repositories"][REPO]["gate"]
+    assert gate["request_id"] is None
+    dedupe_key = gate["dedupe_key"]
+    fix_ledger = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
+    assert fix_ledger["gates"][dedupe_key]["request_id"] is None
+
+    _, second_ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        launch_gate=launch_gate,
+    )
+    assert second_ledger["repositories"][REPO]["reason"] == "already_gated"
 
 
 def test_fix_ledger_absence_and_corruption_fall_back_to_empty(tmp_path: Path) -> None:
     ledger_path = tmp_path / FIX_LEDGER_FILE_NAME
     assert not ledger_path.exists()
-    first, _, _, _ = _build(tmp_path, _observations(red=(REPO,)))
-    assert len(first["proposed_launches"]) == 1
+    first_launch_gate = FakeLaunchGate()
+    _, first_ledger, _, _ = _build(
+        tmp_path, _observations(red=(REPO,)), launch_gate=first_launch_gate
+    )
+    assert first_ledger["repositories"][REPO]["reason"] == "fix_gated"
     assert ledger_path.is_file()
 
-    ledger_path.write_text('{"version":1,"repos":', encoding="utf-8")
-    second, _, _, _ = _build(tmp_path, _observations(red=(REPO,)))
-    assert len(second["proposed_launches"]) == 1
+    ledger_path.write_text('{"version":2,"repos":', encoding="utf-8")
+    second_launch_gate = FakeLaunchGate()
+    _, second_ledger, _, _ = _build(
+        tmp_path, _observations(red=(REPO,)), launch_gate=second_launch_gate
+    )
+    assert second_ledger["repositories"][REPO]["reason"] == "fix_gated"
     recovered = json.loads(ledger_path.read_text())
-    assert recovered["version"] == 1
+    assert recovered["version"] == 2
     assert recovered["repos"][REPO] == {"episode": 0, "red": True}
 
 
-def test_fix_ledger_prunes_unconfigured_expired_and_overflow_rows(
-    tmp_path: Path,
-) -> None:
-    extra_repo = "example/unconfigured"
-    oldest = FIXED_NOW - timedelta(days=FIX_LEDGER_RETENTION_DAYS + 1)
-    valid_keys = [f"ci_fix:{REPO}:{index:016x}:e0" for index in range(MAX_ANNOUNCED_FIXES + 3)]
-    announced = {
-        key: (FIXED_NOW - timedelta(minutes=len(valid_keys) - index)).isoformat()
-        for index, key in enumerate(valid_keys)
-    }
-    announced[f"ci_fix:{REPO}:ffffffffffffffff:e99"] = oldest.isoformat()
-    announced[f"ci_fix:{extra_repo}:eeeeeeeeeeeeeeee:e0"] = FIXED_NOW.isoformat()
+def test_v1_fix_ledger_loads_as_empty_and_is_rewritten_as_v2(tmp_path: Path) -> None:
     (tmp_path / FIX_LEDGER_FILE_NAME).write_text(
         json.dumps(
             {
                 "version": 1,
+                "repos": {REPO: {"episode": 3, "red": True}},
+                "announced": {f"ci_fix:{REPO}:{'a' * 16}:e3": FIXED_NOW.isoformat()},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _, ledger, _, _ = _build(
+        tmp_path,
+        _observations(),
+        clock=_clock_at(FIXED_NOW),
+    )
+
+    assert ledger["repositories"][REPO]["fix_episode"] == 0
+    migrated = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
+    assert migrated["version"] == 2
+    assert migrated["gates"] == {}
+
+
+def test_fix_ledger_prunes_unconfigured_expired_and_overflow_gates(
+    tmp_path: Path,
+) -> None:
+    extra_repo = "example/unconfigured"
+    oldest = FIXED_NOW - timedelta(days=FIX_LEDGER_RETENTION_DAYS + 1)
+    valid_keys = [f"ci_fix:{REPO}:{index:016x}:e0" for index in range(MAX_GATED_FIXES + 3)]
+    gates = {
+        key: {
+            "request_id": f"launch-{index}",
+            "created_at": (FIXED_NOW - timedelta(minutes=len(valid_keys) - index)).isoformat(),
+        }
+        for index, key in enumerate(valid_keys)
+    }
+    gates[f"ci_fix:{REPO}:ffffffffffffffff:e99"] = {
+        "request_id": "launch-old",
+        "created_at": oldest.isoformat(),
+    }
+    gates[f"ci_fix:{extra_repo}:eeeeeeeeeeeeeeee:e0"] = {
+        "request_id": "launch-extra",
+        "created_at": FIXED_NOW.isoformat(),
+    }
+    (tmp_path / FIX_LEDGER_FILE_NAME).write_text(
+        json.dumps(
+            {
+                "version": 2,
                 "repos": {
                     REPO: {"episode": 0, "red": False},
                     extra_repo: {"episode": 7, "red": True},
                 },
-                "announced": announced,
+                "gates": gates,
             }
         ),
         encoding="utf-8",
@@ -1027,9 +1208,9 @@ def test_fix_ledger_prunes_unconfigured_expired_and_overflow_rows(
     pruned = json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())
 
     assert extra_repo not in pruned["repos"]
-    assert len(pruned["announced"]) == MAX_ANNOUNCED_FIXES
-    assert set(pruned["announced"]) == set(valid_keys[-MAX_ANNOUNCED_FIXES:])
-    assert all(f":{extra_repo}:" not in key for key in pruned["announced"])
+    assert len(pruned["gates"]) == MAX_GATED_FIXES
+    assert set(pruned["gates"]) == set(valid_keys[-MAX_GATED_FIXES:])
+    assert all(f":{extra_repo}:" not in key for key in pruned["gates"])
 
 
 @pytest.mark.parametrize(
@@ -1528,10 +1709,10 @@ def test_release_observation_failure_is_report_only_and_does_not_block_other_wor
         clock=lambda: FIXED_NOW,
     )
 
-    assert result["counters"]["fix_proposed"] == 1
+    assert result["counters"]["fix_gated"] == 1
     assert result["counters"]["merged"] == 1
     assert [plan.repo for plan in github.merges] == [CORE]
-    assert ledger["repositories"][REPO]["reason"] == "fix_proposed"
+    assert ledger["repositories"][REPO]["reason"] == "fix_gated"
     assert ledger["repositories"][REPO]["release_reason"] == "gh unavailable"
     assert {notification["tags"][0] for notification in agents.notifications} == {"ci"}
     assert any(notification["tags"] == ["ci", "release"] for notification in agents.notifications)
@@ -1547,15 +1728,16 @@ def test_release_observation_failure_is_report_only_and_does_not_block_other_wor
 class QueueRunner:
     def __init__(self, *results: CommandResult) -> None:
         self.results = list(results)
-        self.calls: list[tuple[list[str], str | None]] = []
+        self.calls: list[tuple[list[str], str | None, str | None]] = []
 
     def __call__(
         self,
         argv: Sequence[str],
         *,
         input_text: str | None = None,
+        cwd: str | None = None,
     ) -> CommandResult:
-        self.calls.append((list(argv), input_text))
+        self.calls.append((list(argv), input_text, cwd))
         return self.results.pop(0)
 
 
@@ -1960,6 +2142,73 @@ def test_default_command_runner_captures_output_and_exec_errors() -> None:
     assert result == CommandResult(0, "ok", "")
     with pytest.raises(CiWatchError, match="failed to execute"):
         run_command(["/definitely/missing/ci-watch-command"])
+
+
+def test_launch_gate_client_creates_request_with_stable_cwd_and_reads_status() -> None:
+    runner = QueueRunner(
+        CommandResult(0, json.dumps({"request_id": "launch-abc"})),
+        CommandResult(0, json.dumps({"status": "pending"})),
+    )
+    client = LaunchGateClient("/sase", runner)
+
+    request_id = client.create(
+        {
+            "schema_version": 1,
+            "prompt": "hi",
+            "reason": "r",
+            "approval": "required",
+            "max_slots": 1,
+        }
+    )
+    assert request_id == "launch-abc"
+    argv, _, cwd = runner.calls[0]
+    assert argv[:3] == ["/sase", "launch", "request"]
+    assert argv[argv.index("-o") + 1] == "json"
+    assert argv[argv.index("-s") + 1] == "ci_watch"
+    assert cwd == str(Path.home())
+    temp_file = Path(argv[argv.index("-f") + 1])
+    assert not temp_file.exists()
+
+    assert client.status("launch-abc") == "pending"
+    assert runner.calls[1][0] == ["/sase", "gate", "show", "-k", "launch", "-i", "launch-abc", "-j"]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        CommandResult(0, "{bad"),
+        CommandResult(0, json.dumps({"request_id": 5})),
+        CommandResult(0, json.dumps({})),
+    ],
+)
+def test_launch_gate_client_create_returns_none_on_unparsable_descriptor(
+    result: CommandResult,
+) -> None:
+    client = LaunchGateClient("/sase", QueueRunner(result))
+    assert client.create({"prompt": "hi"}) is None
+
+
+def test_launch_gate_client_create_raises_on_nonzero_exit() -> None:
+    client = LaunchGateClient("/sase", QueueRunner(CommandResult(1, stderr="boom")))
+    with pytest.raises(CiWatchError, match="launch request failed"):
+        client.create({"prompt": "hi"})
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (CommandResult(1, stderr="boom"), None),
+        (CommandResult(0, "{bad"), None),
+        (CommandResult(0, json.dumps({"status": "mystery"})), None),
+        (CommandResult(0, json.dumps({"status": "answered"})), "answered"),
+    ],
+)
+def test_launch_gate_client_status_fails_closed(
+    result: CommandResult,
+    expected: str | None,
+) -> None:
+    client = LaunchGateClient("/sase", QueueRunner(result))
+    assert client.status("launch-abc") == expected
 
 
 @pytest.mark.parametrize(
