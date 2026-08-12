@@ -39,8 +39,6 @@ Issues = "https://github.com/bbugyi200/bugyi-chops/issues"
 
 [project.scripts]
 bugyi_chop_ci_watch = "bugyi_chops.ci_watch:main"
-bugyi_chop_recent_bug_audit = "bugyi_chops.recent_audits:bug_main"
-bugyi_chop_recent_improvement_audit = "bugyi_chops.recent_audits:improvement_main"
 bugyi_chop_toobig_split = "bugyi_chops.toobig_split:main"
 
 [dependency-groups]

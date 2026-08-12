@@ -1,15 +1,13 @@
 # bugyi-chops
 
 `bugyi-chops` is Bryan Bugyi's community [SASE](https://sase.sh/) plugin for
-scheduled Axe jobs that need to propose coding-agent work. It supplies four console
+scheduled Axe jobs that need to propose coding-agent work. It supplies two console
 scripts:
 
 | Script | What it proposes |
 | --- | --- |
 | `bugyi_chop_ci_watch` | Idle-gated CI repairs and explicitly enabled, guarded release merges |
 | `bugyi_chop_toobig_split` | One `%auto #split_file:<path>` agent per oversized Python file, chained in scan order |
-| `bugyi_chop_recent_bug_audit` | One recent-commit audit for confirmed correctness bugs |
-| `bugyi_chop_recent_improvement_audit` | One recent-commit audit for narrow, objective improvements |
 
 The scripts never launch agents themselves. They scan or assemble a prompt, then use
 the public `sase.chops` SDK to atomically write a validated result document. Axe owns
@@ -51,12 +49,12 @@ Axe invokes a configured script as `<script> --context <context.json>` and suppl
 {
   "schema_version": 1,
   "status": "ok",
-  "summary": "recent_bug_audit: targets=1 proposals=1",
-  "counters": {"targets": 1, "proposals": 1},
+  "summary": "toobig_split: files=1 proposals=1 skipped=0",
+  "counters": {"files": 1, "proposals": 1, "skipped": 0},
   "proposed_launches": [
     {
-      "id": "audit",
-      "prompt": "#pr(recent_bug_audit_sase_current)\n\nAudit recent commits...",
+      "id": "split_file-src-large_py",
+      "prompt": "%auto #split_file:src/large.py",
       "workspace": "gh:sase-org/sase"
     }
   ]
@@ -146,75 +144,6 @@ environment variables are also accepted: `SASE_TOOBIG_SPLIT_PROJECT`,
 `SASE_TOOBIG_SPLIT_REPO_ROOT`, `SASE_TOOBIG_SPLIT_LAUNCH_REF`,
 `SASE_TOOBIG_SPLIT_TREES`, `SASE_TOOBIG_SPLIT_LIMITS`, and
 `SASE_TOOBIG_SPLIT_TOOBIG`.
-
-## Recent-commit audits
-
-The audit scripts only assemble the audit proposal. The shared
-`git.commits_since` trigger owns commit thresholds and checkpoints, so there are no
-private marker files to corrupt or race. `on_action_success` advances the checkpoint
-only after the proposed audit agent completes successfully.
-
-```yaml
-axe:
-  lumberjacks:
-    audits:
-      description: |-
-        Audit recent commits when repository drift crosses thresholds
-
-        Runs every five minutes so the `git.commits_since` trigger, not the chop script, decides whether enough commits
-        have accumulated. Keep recent-commit review chops here; maintenance scans belong in their own lane.
-
-        `checkpoint: on_action_success` advances the trigger only after the proposed audit agent completes
-        successfully, so failed reviews do not hide uninspected commits.
-      interval: 300
-      chops:
-        recent_bug_audit:
-          script: bugyi_chop_recent_bug_audit
-          description: |-
-            Audit recent commits for confirmed correctness bugs
-
-            Checks the `sase` target no more than once per hour and proposes work only after 200 commits have landed
-            since the last successful action.
-
-            The generated audit agent inspects the recent scope for correctness regressions and fixes only confirmed
-            bugs. It is named `audit_bugs.<project>.@`, so SASE assigns a short alphanumeric suffix at launch while
-            keeping the agent in the `audit_bugs` hood for hood-based inhibit guards.
-          run_every: 1h
-          trigger:
-            git.commits_since:
-              project: "{target.name}"
-              threshold: 200
-              checkpoint: on_action_success
-          for_each:
-            source: projects
-            names: [sase]
-
-        recent_improvement_audit:
-          script: bugyi_chop_recent_improvement_audit
-          description: |-
-            Audit recent commits for clear objective improvements
-
-            Checks the `sase` target no more than once per hour and proposes work only after 200 commits have landed
-            since the last successful action.
-
-            The generated audit agent looks for narrow, objective wins and leaves the tree untouched when the value is
-            speculative. It is named `audit_improvements.<project>.@`, so SASE assigns a short alphanumeric suffix at
-            launch while keeping the agent in the `audit_improvements` hood for hood-based inhibit guards.
-          run_every: 1h
-          trigger:
-            git.commits_since:
-              project: "{target.name}"
-              threshold: 200
-              checkpoint: on_action_success
-          for_each:
-            source: projects
-            names: [sase]
-```
-
-Each prompt records the current HEAD when `target.workspace_dir` is available, uses a
-`audit_bugs.<project>.@` or `audit_improvements.<project>.@` agent-name template that
-SASE resolves at launch, and includes a project- and revision-specific `#pr(...)`
-rollover.
 
 ## Debugging
 
