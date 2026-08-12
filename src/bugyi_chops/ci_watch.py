@@ -1473,6 +1473,7 @@ def _repo_evidence(
         "gate_pending",
         "already_gated",
         "gate_failed",
+        "dry_run",
     }:
         return reason
     if state is RepoState.GREEN and repo in heads:
@@ -1895,6 +1896,7 @@ def build_ci_watch_result(
             continue
         mature_red_repos.append(repo)
 
+    mode = _dry_run_mode()
     if mature_red_repos:
         if not config.fix_enabled:
             for repo in mature_red_repos:
@@ -1945,6 +1947,10 @@ def build_ci_watch_result(
                             _mark(ledger_repos, repo, reason="fix_cap_reached")
                             continue
                         gate_attempts += 1
+                        if mode == "dry_run":
+                            counters["fix_suppressed"] += 1
+                            _mark(ledger_repos, repo, reason="dry_run")
+                            continue
                         payload = {
                             "schema_version": 1,
                             "prompt": _gate_prompt(repo, failure),
@@ -2065,7 +2071,6 @@ def build_ci_watch_result(
             continue
         release_plans.append(plan)
 
-    mode = _dry_run_mode()
     merged_keys: set[str] = set()
     merged_notifications: list[tuple[str, ReleasePr]] = []
     for plan in release_plans:

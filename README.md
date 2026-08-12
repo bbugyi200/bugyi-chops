@@ -110,7 +110,10 @@ Each tick evaluates, in order, whether a new gate is suppressed — first match 
    global: while one CI-fix gate is unanswered, no new gate is filed for any repo.
 5. The candidate's dedupe key is already recorded in the ledger → `already_gated`.
 6. The per-tick cap `max_fix_proposals_per_tick` is reached → `fix_cap_reached`.
-7. Otherwise, the gate is created.
+7. The tick is a dry run (`SASE_CHOP_DRY_RUN=1`) → `dry_run`. A dry run reports the
+   gate it would have filed but never creates one and never records its dedupe key, so
+   the next live tick still gates that failure.
+8. Otherwise, the gate is created.
 
 The durable ledger (`ci_watch_fixes.json`, schema version 2) records each gate's
 request id under the dedupe key `ci_fix:{repo}:{failing_job_fingerprint}:e{episode}`,

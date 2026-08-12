@@ -1044,6 +1044,40 @@ def test_terminal_gate_status_does_not_resurrect_dedupe_key(
     assert len(launch_gate.payloads) == 1
 
 
+def test_dry_run_tick_files_no_gate_and_records_no_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "1")
+    launch_gate = FakeLaunchGate()
+
+    result, ledger, _, agents = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        launch_gate=launch_gate,
+    )
+
+    assert result["status"] == "no_op"
+    assert result["counters"]["fix_gated"] == 0
+    assert result["counters"]["fix_suppressed"] == 1
+    assert launch_gate.payloads == []
+    assert agents.notifications == []
+    assert ledger["repositories"][REPO]["reason"] == "dry_run"
+    assert json.loads((tmp_path / FIX_LEDGER_FILE_NAME).read_text())["gates"] == {}
+
+    # The skipped key stays unrecorded, so a later live tick still gates it.
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    live, live_ledger, _, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        launch_gate=launch_gate,
+    )
+
+    assert live["counters"]["fix_gated"] == 1
+    assert len(launch_gate.payloads) == 1
+    assert live_ledger["repositories"][REPO]["reason"] == "fix_gated"
+
+
 def test_gate_pending_probe_is_bounded_per_tick(tmp_path: Path) -> None:
     launch_gate = FakeLaunchGate()
     gates = {
