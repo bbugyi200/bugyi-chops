@@ -1,4 +1,4 @@
-"""Watch SASE CI health, avoid overlapping repairs, and merge guarded release PRs."""
+"""Watch SASE CI health, notify on failures, and merge guarded release-please PRs."""
 
 from __future__ import annotations
 
@@ -25,14 +25,14 @@ from sase.chops import (
     validate_chop_report,
 )
 
-from bugyi_chops._common import context_vars, result_with_summary, run_chop, safe_fragment
+from bugyi_chops._common import context_vars, result_with_summary, run_chop
 from bugyi_chops._report import add_facts_footer, start_report
 
 CHOP_NAME = "ci_watch"
 RED_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure", "action_required"})
 GREEN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
 GREEN_CHECK_CONCLUSIONS = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
-RELEASE_BRANCH_PREFIXES = ("release-please--", "release-plz-")
+RELEASE_BRANCH_PREFIXES = ("release-please--", "release-please/")
 IN_FLIGHT_STATUSES = frozenset({"queued", "in_progress", "waiting", "pending", "requested"})
 KNOWN_RUN_STATUSES = IN_FLIGHT_STATUSES | {"completed"}
 REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -42,25 +42,24 @@ TOKEN_PATTERN = re.compile(
     r"(?i)(?:github_pat_|gh[pousr]_|bearer\s+|token\s*[=:]|secret\s*[=:])\S*"
 )
 MAX_REPOS = 50
-MAX_LEDGER_NAMES = 10
 MAX_HEAD_RUNS = 20
 MAX_HEAD_JOBS = 100
 MAX_HEAD_EVIDENCE_REPOS_PER_TICK = 10
 MAX_RELEASE_PR_DETAILS = 8
-MAX_LEDGER_MERGES = 50
-MAX_GATED_FIXES = 100
-MAX_GATE_POLLS_PER_TICK = 10
+MAX_STATE_RELEASES = 50
+MAX_FAILURE_JOBS_PER_NOTIFICATION = 8
+MAX_STEPS_PER_JOB = 5
 MAX_TEXT = 240
-STREAK_FILE_NAME = "ci_watch_red_streaks.json"
-FIX_LEDGER_FILE_NAME = "ci_watch_fixes.json"
-RELEASE_LEDGER_FILE_NAME = "ci_watch_releases.json"
-RELEASE_REPORT_FILE_NAME = "ci_watch_releases.report.json"
-FIX_LEDGER_RETENTION_DAYS = 90
-RELEASE_LEDGER_RETENTION_DAYS = 90
-RELEASE_REPORT_WINDOW_DAYS = 30
+STATE_FILE_NAME = "ci_watch_state.json"
+LEGACY_RELEASE_LEDGER_FILE_NAME = "ci_watch_releases.json"
+LEGACY_RELEASE_REPORT_FILE_NAME = "ci_watch_releases.report.json"
+REPORT_FILE_NAME = "ci_watch.report.json"
+STATE_RETENTION_DAYS = 90
+REPORT_RECENT_DAYS = 30
 RELEASE_VERSION_PATTERN = re.compile(
     r"(?<![0-9A-Za-z])v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)"
 )
+REMOVED_CONFIG_KEYS = frozenset({"max_fix_proposals_per_tick", "red_debounce_ticks", "fix_enabled"})
 
 type JsonObject = dict[str, Any]
 
@@ -162,14 +161,10 @@ def _json_object(raw: str, *, source: str) -> JsonObject:
     return cast(JsonObject, value)
 
 
-def _json_array(raw: str, *, source: str) -> list[Any]:
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise CiWatchError(f"{source} returned malformed JSON: {error}") from error
-    if not isinstance(value, list):
-        raise CiWatchError(f"{source} returned non-array JSON")
-    return value
+def _safe_github_url(value: object) -> str | None:
+    if isinstance(value, str) and value.startswith("https://github.com/"):
+        return _bounded(value, limit=512)
+    return None
 
 
 @dataclass(frozen=True)
@@ -239,11 +234,11 @@ def _nested_failure(run: Mapping[str, Any]) -> bool:
     for item in jobs:
         if not isinstance(item, dict):
             continue
-        if str(item.get("conclusion", "")).lower() == "failure":
+        if str(item.get("conclusion", "")).lower() in RED_CONCLUSIONS:
             return True
         steps = item.get("steps")
         if isinstance(steps, list) and any(
-            isinstance(step, dict) and str(step.get("conclusion", "")).lower() == "failure"
+            isinstance(step, dict) and str(step.get("conclusion", "")).lower() in RED_CONCLUSIONS
             for step in steps
         ):
             return True
@@ -291,26 +286,44 @@ class BranchHead:
 
 
 @dataclass(frozen=True)
+class FailingJobEvidence:
+    workflow: str
+    job: str
+    conclusion: str
+    url: str | None = None
+    steps: tuple[str, ...] = ()
+
+    @property
+    def fingerprint(self) -> tuple[str, str, str, tuple[str, ...]]:
+        return (self.workflow, self.job, self.conclusion, self.steps)
+
+    @property
+    def label(self) -> str:
+        return f"{self.workflow} › {self.job} — {self.conclusion}"
+
+
+@dataclass(frozen=True)
 class HeadCiEvidence:
     sha: str
     has_in_flight: bool
     all_completed_green: bool
-    failing_jobs: tuple[str, ...]
+    failing_jobs: tuple[FailingJobEvidence, ...]
     successful_jobs: tuple[str, ...]
-    run_url: str | None = None
 
 
 @dataclass(frozen=True)
 class FailureEvidence:
     sha: str
-    failing_jobs: tuple[str, ...]
-    run_url: str | None
+    jobs: tuple[FailingJobEvidence, ...]
     head_unsettled: bool = False
     current_head_sha: str | None = None
 
     @property
     def fingerprint(self) -> tuple[str, ...]:
-        return self.failing_jobs
+        return tuple(
+            "\0".join((job.workflow, job.job, job.conclusion, "\0".join(job.steps)))
+            for job in sorted(self.jobs, key=lambda item: item.fingerprint)
+        )
 
     @property
     def fingerprint_key(self) -> str:
@@ -326,40 +339,79 @@ class RepoDecision:
     failure: FailureEvidence | None = None
 
 
-def _failed_job_names(commit: Mapping[str, Any]) -> tuple[str, ...]:
-    names: set[str] = set()
-    runs = commit.get("runs")
+def _run_workflow_name(run: Mapping[str, Any]) -> str:
+    for key in ("workflow_name", "workflow", "name", "display_title"):
+        value = run.get(key)
+        if isinstance(value, str) and value.strip():
+            return _bounded(value, limit=120)
+    return "workflow"
+
+
+def _failing_steps(job: Mapping[str, Any]) -> tuple[str, ...]:
+    raw_steps = job.get("steps")
+    if not isinstance(raw_steps, list):
+        return ()
+    names: list[str] = []
+    for step in raw_steps:
+        if not isinstance(step, dict):
+            continue
+        conclusion = str(step.get("conclusion", "")).lower()
+        if conclusion not in RED_CONCLUSIONS:
+            continue
+        name = step.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(_bounded(name, limit=120))
+    return tuple(names[:MAX_STEPS_PER_JOB])
+
+
+def _failed_jobs_from_runs(runs: object) -> tuple[FailingJobEvidence, ...]:
     if not isinstance(runs, list):
         return ()
+    failures: dict[tuple[str, str, str, tuple[str, ...]], FailingJobEvidence] = {}
     for run in runs:
         if not isinstance(run, dict):
             continue
+        run_conclusion = str(run.get("conclusion", "")).lower()
+        run_red = run_conclusion in RED_CONCLUSIONS or (
+            run_conclusion == "cancelled" and _nested_failure(run)
+        )
+        if not run_red:
+            continue
+        workflow = _run_workflow_name(run)
+        run_url = _safe_github_url(run.get("html_url")) or _safe_github_url(run.get("url"))
         jobs = run.get("jobs")
         if not isinstance(jobs, list):
             continue
         for job in jobs:
             if not isinstance(job, dict):
                 continue
-            conclusion = str(job.get("conclusion", "")).lower()
-            if conclusion not in RED_CONCLUSIONS:
-                continue
             name = job.get("name")
-            if isinstance(name, str) and name.strip():
-                names.add(_bounded(name, limit=100))
-    return tuple(sorted(names))
+            if not isinstance(name, str) or not name.strip():
+                continue
+            steps = _failing_steps(job)
+            raw_conclusion = str(job.get("conclusion", "")).lower()
+            if raw_conclusion in RED_CONCLUSIONS:
+                conclusion = raw_conclusion
+            elif steps and run_conclusion == "cancelled":
+                conclusion = "failure"
+            else:
+                continue
+            job_url = _safe_github_url(job.get("html_url")) or _safe_github_url(job.get("url"))
+            evidence = FailingJobEvidence(
+                workflow=workflow,
+                job=_bounded(name, limit=120),
+                conclusion=conclusion,
+                url=job_url or run_url,
+                steps=steps,
+            )
+            failures[evidence.fingerprint] = evidence
+    return tuple(failures[key] for key in sorted(failures))
 
 
-def _failure_run_url(commit: Mapping[str, Any]) -> str | None:
-    runs = commit.get("runs")
-    if not isinstance(runs, list):
-        return None
-    for run in runs:
-        if not isinstance(run, dict):
-            continue
-        url = run.get("url")
-        if isinstance(url, str) and url.startswith("https://github.com/"):
-            return url[:MAX_TEXT]
-    return None
+def _commit_sha(observation: RepoObservation) -> str:
+    if observation.commit is None:
+        raise CiWatchError(f"{observation.repo} has no settled commit")
+    return _sha(observation.commit.get("sha"))
 
 
 def decide_repo(
@@ -377,7 +429,7 @@ def decide_repo(
     settled_sha = _commit_sha(observation)
     current = head.sha.startswith(settled_sha)
     if base_state is RepoState.RED:
-        settled_jobs = _failed_job_names(observation.commit)
+        settled_jobs = _failed_jobs_from_runs(observation.commit.get("runs"))
         if not settled_jobs:
             return RepoDecision(RepoState.ERROR, "red_evidence_missing_job_identity")
         if current:
@@ -385,11 +437,7 @@ def decide_repo(
                 RepoState.RED,
                 "actionable_failure",
                 head,
-                FailureEvidence(
-                    head.sha,
-                    settled_jobs,
-                    _failure_run_url(observation.commit),
-                ),
+                FailureEvidence(head.sha, settled_jobs),
             )
         if head_evidence is None or head_evidence.sha != head.sha:
             return RepoDecision(RepoState.ERROR, "missing_head_ci_evidence")
@@ -398,13 +446,11 @@ def decide_repo(
                 RepoState.RED,
                 "actionable_failure",
                 head,
-                FailureEvidence(
-                    head.sha,
-                    head_evidence.failing_jobs,
-                    head_evidence.run_url,
-                ),
+                FailureEvidence(head.sha, head_evidence.failing_jobs),
             )
-        remaining = tuple(sorted(set(settled_jobs).difference(head_evidence.successful_jobs)))
+        remaining = tuple(
+            job for job in settled_jobs if job.job not in set(head_evidence.successful_jobs)
+        )
         if not remaining:
             return RepoDecision(RepoState.GREEN, "superseded_by_newer_success", head)
         if head_evidence.all_completed_green:
@@ -417,17 +463,16 @@ def decide_repo(
                 FailureEvidence(
                     settled_sha,
                     remaining,
-                    _failure_run_url(observation.commit),
                     head_unsettled=True,
                     current_head_sha=head.sha,
                 ),
             )
-        return RepoDecision(RepoState.PENDING, "superseded_or_unsettled")
+        return RepoDecision(RepoState.PENDING, "superseded_or_unsettled", head)
     if base_state is RepoState.GREEN:
         if current:
             return RepoDecision(RepoState.GREEN, "green", head)
-        return RepoDecision(RepoState.PENDING, "newer_head_unsettled")
-    return RepoDecision(RepoState.PENDING, "superseded_or_unsettled")
+        return RepoDecision(RepoState.PENDING, "newer_head_unsettled", head)
+    return RepoDecision(RepoState.PENDING, "superseded_or_unsettled", head)
 
 
 @dataclass(frozen=True)
@@ -447,7 +492,7 @@ class ReleasePr:
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> ReleasePr:
         number = value.get("number")
-        if not isinstance(number, int) or number <= 0:
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
             raise CiWatchError("release PR has an invalid number")
         rollup = value.get("statusCheckRollup")
         if not isinstance(rollup, list):
@@ -502,6 +547,10 @@ class ReleaseObservation:
     error: str | None = None
 
 
+def _is_release_please_branch(value: str) -> bool:
+    return value.startswith(RELEASE_BRANCH_PREFIXES)
+
+
 def plan_release_merge(
     repo: str,
     branch_state: RepoState,
@@ -517,7 +566,7 @@ def plan_release_merge(
     if len(candidates) != 1:
         return None, "ambiguous_release_prs"
     pr = candidates[0]
-    if not pr.head_ref_name.startswith(RELEASE_BRANCH_PREFIXES):
+    if not _is_release_please_branch(pr.head_ref_name):
         return None, "not_release_pr"
     if pr.is_draft:
         return None, "release_pr_draft"
@@ -571,14 +620,7 @@ class GitHubReader:
     def workflow_count(self, repo: str) -> int:
         repo = _repo(repo)
         data = self._json(
-            [
-                "api",
-                "-X",
-                "GET",
-                f"repos/{repo}/actions/workflows",
-                "-f",
-                "per_page=1",
-            ],
+            ["api", "-X", "GET", f"repos/{repo}/actions/workflows", "-f", "per_page=1"],
             source=f"{repo} workflows",
         )
         if not isinstance(data, dict):
@@ -613,8 +655,8 @@ class GitHubReader:
         )
         has_in_flight = False
         all_completed_green = bool(runs)
-        latest_job_conclusions: dict[str, str] = {}
-        red_run_url: str | None = None
+        failing_jobs: dict[tuple[str, str, str, tuple[str, ...]], FailingJobEvidence] = {}
+        successful_jobs: dict[str, None] = {}
         terminal_red_without_job = False
         for run in runs:
             status = run.get("status")
@@ -636,6 +678,13 @@ class GitHubReader:
                 raise CiWatchError(f"{repo} HEAD workflow run has an invalid id")
             jobs = self._run_jobs(repo, run_id)
             run_has_red_job = False
+            synthetic_run = {
+                "name": run.get("name"),
+                "workflow_name": run.get("name"),
+                "conclusion": normalized_conclusion,
+                "html_url": run.get("html_url"),
+                "jobs": jobs,
+            }
             for job in jobs:
                 job_status = job.get("status")
                 conclusion_value = job.get("conclusion")
@@ -651,56 +700,28 @@ class GitHubReader:
                     continue
                 if not isinstance(conclusion_value, str):
                     raise CiWatchError(f"{repo} HEAD jobs contain an invalid conclusion")
-                bounded_name = _bounded(name, limit=100)
                 normalized_job_conclusion = conclusion_value.lower()
-                latest_job_conclusions.setdefault(bounded_name, normalized_job_conclusion)
                 if normalized_job_conclusion in RED_CONCLUSIONS:
                     run_has_red_job = True
+                elif normalized_job_conclusion == "success":
+                    successful_jobs[_bounded(name, limit=120)] = None
+            for failure in _failed_jobs_from_runs([synthetic_run]):
+                failing_jobs[failure.fingerprint] = failure
             if normalized_conclusion in RED_CONCLUSIONS or (
                 normalized_conclusion == "cancelled" and run_has_red_job
             ):
                 terminal_red_without_job = terminal_red_without_job or not run_has_red_job
-                if red_run_url is None:
-                    candidate_url = run.get("html_url")
-                    if isinstance(candidate_url, str) and candidate_url.startswith(
-                        "https://github.com/"
-                    ):
-                        red_run_url = candidate_url[:MAX_TEXT]
-        failing_jobs = tuple(
-            sorted(
-                name
-                for name, conclusion in latest_job_conclusions.items()
-                if conclusion in RED_CONCLUSIONS
-            )
-        )
         if terminal_red_without_job and not failing_jobs:
             raise CiWatchError(f"{repo} HEAD red evidence has no failing job identity")
-        successful_jobs = tuple(
-            sorted(
-                name
-                for name, conclusion in latest_job_conclusions.items()
-                if conclusion == "success"
-            )
-        )
         return HeadCiEvidence(
             sha=sha,
             has_in_flight=has_in_flight,
             all_completed_green=all_completed_green,
-            failing_jobs=failing_jobs,
-            successful_jobs=successful_jobs,
-            run_url=red_run_url,
+            failing_jobs=tuple(failing_jobs[key] for key in sorted(failing_jobs)),
+            successful_jobs=tuple(sorted(successful_jobs)),
         )
 
-    def has_in_flight_runs(self, repo: str, branch: str) -> bool:
-        data = self._workflow_runs(repo, branch)
-        return any(str(run.get("status", "")).lower() in IN_FLIGHT_STATUSES for run in data)
-
-    def generator_busy(self, repo: str, branch: str, generator: str) -> bool:
-        needles = (
-            ("publish", "release-please")
-            if generator == "release-please"
-            else ("release", "release-plz")
-        )
+    def generator_busy(self, repo: str, branch: str) -> bool:
         for run in self._workflow_runs(repo, branch):
             if str(run.get("status", "")).lower() not in IN_FLIGHT_STATUSES:
                 continue
@@ -708,7 +729,7 @@ class GitHubReader:
             if not all(isinstance(label, str) and len(label) <= MAX_TEXT for label in labels):
                 raise CiWatchError(f"{repo} workflow run has an invalid name or path")
             label = " ".join(item.lower() for item in labels)
-            if any(needle in label for needle in needles):
+            if "release-please" in label or "publish" in label:
                 return True
         return False
 
@@ -810,8 +831,8 @@ class GitHubReader:
                 raise CiWatchError(f"{repo} release PR list contains a non-object")
             head = item.get("headRefName")
             number = item.get("number")
-            if isinstance(head, str) and head.startswith(RELEASE_BRANCH_PREFIXES):
-                if not isinstance(number, int) or number <= 0:
+            if isinstance(head, str) and _is_release_please_branch(head):
+                if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
                     raise CiWatchError(f"{repo} release PR has an invalid number")
                 numbers.append(number)
         return numbers
@@ -852,53 +873,27 @@ class GitHubReader:
         )
 
 
-@dataclass(frozen=True)
-class AgentProbe:
-    names: tuple[str, ...]
+class SaseNotifier:
+    """Send ci_watch SASE notifications and nothing else."""
 
-    @property
-    def count(self) -> int:
-        return len(self.names)
-
-
-class AgentsGate:
     def __init__(self, executable: str, runner: CommandRunner = run_command) -> None:
         self.executable = executable
         self._runner = runner
-
-    def probe(self) -> AgentProbe:
-        result = self._runner([self.executable, "agent", "list", "-j"])
-        if result.returncode != 0:
-            raise CiWatchError(
-                f"agent probe failed: exit_code={result.returncode} "
-                f"detail={_bounded(result.stderr or result.stdout) or '-'}"
-            )
-        data = _json_array(result.stdout, source="agent probe")
-        names: list[str] = []
-        for index, row in enumerate(data):
-            if not isinstance(row, dict):
-                raise CiWatchError(f"agent probe row {index} is not an object")
-            name = row.get("name") or row.get("agent_name")
-            if not isinstance(name, str) or not name.strip():
-                raise CiWatchError(f"agent probe row {index} has no name")
-            names.append(_bounded(name, limit=100))
-        return AgentProbe(tuple(names))
 
     def notify(
         self,
         notes: Sequence[str],
         *,
-        icon: str | None = None,
+        icon: str,
+        tags: Sequence[str],
         action: str | None = None,
         action_data: Mapping[str, str] | None = None,
-        tags: Sequence[str] = (),
-    ) -> bool:
+    ) -> None:
         payload_data: JsonObject = {
-            "notes": [_bounded(note) for note in notes],
+            "notes": [_bounded(note, limit=512) for note in notes],
             "tags": [_bounded(tag, limit=64) for tag in tags],
+            "icon": _bounded(icon, limit=16),
         }
-        if icon is not None:
-            payload_data["icon"] = _bounded(icon, limit=16)
         if action is not None:
             payload_data["action"] = _bounded(action, limit=64)
         if action_data is not None:
@@ -906,79 +901,15 @@ class AgentsGate:
                 _bounded(key, limit=64): _bounded(value, limit=4096)
                 for key, value in action_data.items()
             }
-        payload = json.dumps(payload_data)
         result = self._runner(
             [self.executable, "notify", "create", "-s", CHOP_NAME],
-            input_text=payload,
+            input_text=json.dumps(payload_data),
         )
-        return result.returncode == 0
-
-
-GATE_STATUSES = frozenset({"pending", "answered", "cancelled", "timeout"})
-
-
-class LaunchGateClient:
-    """Create durable LaunchApproval gates and poll their status."""
-
-    def __init__(self, executable: str, runner: CommandRunner = run_command) -> None:
-        self.executable = executable
-        self._runner = runner
-
-    def create(self, payload: Mapping[str, Any]) -> str | None:
-        """Create a LaunchApproval request; return its request id if parseable.
-
-        Raises CiWatchError only when the command itself fails (non-zero exit
-        or exec failure). A successful exit with an unparsable descriptor
-        returns None so the caller can still record the dedupe key: the gate
-        may well have been created, and not duplicating it matters more than
-        being able to poll it.
-        """
-        fd, temp_name = tempfile.mkstemp(prefix=".ci-watch-launch-", suffix=".json")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump(dict(payload), stream)
-            result = self._runner(
-                [
-                    self.executable,
-                    "launch",
-                    "request",
-                    "-f",
-                    temp_name,
-                    "-o",
-                    "json",
-                    "-s",
-                    CHOP_NAME,
-                ],
-                cwd=str(Path.home()),
-            )
-        finally:
-            with suppress(FileNotFoundError):
-                os.unlink(temp_name)
         if result.returncode != 0:
             detail = _bounded(result.stderr or result.stdout) or "-"
             raise CiWatchError(
-                f"launch request failed: exit_code={result.returncode} detail={detail}"
+                f"notification failed: exit_code={result.returncode} detail={detail}"
             )
-        try:
-            data = _json_object(result.stdout, source="launch request")
-        except CiWatchError:
-            return None
-        request_id = data.get("request_id")
-        return request_id if isinstance(request_id, str) and request_id.strip() else None
-
-    def status(self, request_id: str) -> str | None:
-        """Return a gate's status, or None if it cannot be read or parsed."""
-        result = self._runner(
-            [self.executable, "gate", "show", "-k", "launch", "-i", request_id, "-j"]
-        )
-        if result.returncode != 0:
-            return None
-        try:
-            data = _json_object(result.stdout, source="gate show")
-        except CiWatchError:
-            return None
-        value = data.get("status")
-        return value if isinstance(value, str) and value in GATE_STATUSES else None
 
 
 @dataclass(frozen=True)
@@ -987,49 +918,51 @@ class Config:
     gh_bin: str
     sase_bin: str
     repos: tuple[str, ...]
-    release_repositories: dict[str, str]
+    release_repositories: tuple[str, ...]
     merge_order: tuple[str, ...]
     max_merges: int
-    max_fixes: int
-    red_debounce_ticks: int
-    fix_enabled: bool
     merge_enabled: bool
 
     @classmethod
     def from_invocation(cls, invocation: ChopInvocation) -> Config:
         values = context_vars(invocation)
+        removed = sorted(key for key in REMOVED_CONFIG_KEYS if key in values)
+        if removed:
+            raise CiWatchError(
+                "unsupported ci_watch config keys: "
+                + ", ".join(removed)
+                + "; CI fix gates were removed"
+            )
         repos = _string_list(values.get("repos"), "repos")
         if not repos or len(repos) > MAX_REPOS:
             raise CiWatchError(f"repos must contain between 1 and {MAX_REPOS} entries")
         normalized_repos = tuple(_repo(repo) for repo in repos)
         if len(set(normalized_repos)) != len(normalized_repos):
             raise CiWatchError("repos contains duplicates")
-        releases_value = values.get("release_repositories", {})
-        if not isinstance(releases_value, dict):
-            raise CiWatchError("release_repositories must be an object")
-        releases: dict[str, str] = {}
-        for raw_repo, raw_generator in releases_value.items():
-            repo = _repo(raw_repo)
+        releases = _string_list(values.get("release_repositories", []), "release_repositories")
+        release_repositories = tuple(_repo(repo) for repo in releases)
+        if len(set(release_repositories)) != len(release_repositories):
+            raise CiWatchError("release_repositories contains duplicates")
+        for repo in release_repositories:
             if repo not in normalized_repos:
                 raise CiWatchError(f"release repository {repo!r} is not in repos")
-            if raw_generator not in {"release-please", "release-plz"}:
-                raise CiWatchError(f"unsupported release generator for {repo}")
-            releases[repo] = raw_generator
-        raw_order = _string_list(values.get("merge_order", list(normalized_repos)), "merge_order")
+        raw_order = _string_list(
+            values.get("merge_order", list(release_repositories)), "merge_order"
+        )
         merge_order = tuple(_resolve_order_repo(item, normalized_repos) for item in raw_order)
         if len(set(merge_order)) != len(merge_order):
             raise CiWatchError("merge_order contains duplicates")
+        for repo in merge_order:
+            if repo not in release_repositories:
+                raise CiWatchError(f"merge_order repository {repo!r} is not release-enabled")
         return cls(
             actstat_bin=_binary(values, "actstat_bin", "actstat"),
             gh_bin=_binary(values, "gh_bin", "gh"),
             sase_bin=_binary(values, "sase_bin", "sase"),
             repos=normalized_repos,
-            release_repositories=releases,
+            release_repositories=release_repositories,
             merge_order=merge_order,
             max_merges=_positive_int(values, "max_merges_per_tick", 1),
-            max_fixes=_positive_int(values, "max_fix_proposals_per_tick", 1),
-            red_debounce_ticks=_positive_int(values, "red_debounce_ticks", 2),
-            fix_enabled=_bool(values, "fix_enabled", True),
             merge_enabled=_bool(values, "merge_enabled", False),
         )
 
@@ -1075,66 +1008,6 @@ def _bool(values: Mapping[str, Any], key: str, default: bool) -> bool:
     return value
 
 
-def _commit_sha(observation: RepoObservation) -> str:
-    if observation.commit is None:
-        raise CiWatchError(f"{observation.repo} has no settled commit")
-    return _sha(observation.commit.get("sha"))
-
-
-def _fix_agent_name(repo: str) -> str:
-    slug = safe_fragment(repo.rsplit("/", 1)[-1])
-    return f"ci_fix.{slug}.@"  # SASE replaces `@` with a concrete launch token.
-
-
-def _fix_prompt(repo: str, failure: FailureEvidence) -> str:
-    slug = safe_fragment(repo.rsplit("/", 1)[-1])
-    pr_name = f"ci_fix_{slug.replace('-', '_')}_{failure.sha[:7]}"
-    evidence = "\n".join(f"- {name}" for name in failure.failing_jobs)
-    unsettled_note = ""
-    if failure.head_unsettled:
-        unsettled_note = f"""
-The pinned failure is on a settled commit older than the current unsettled HEAD
-({failure.current_head_sha}). Re-verify these job failures against current state
-before changing code.
-"""
-    return f"""\
-#pr({pr_name}, status=ready)
-
-#actstat(repo={repo})
-
-Repair the current default-branch CI failure in {repo}.
-
-Pinned failing run: {failure.run_url or "unavailable"}
-Pinned failing commit: {failure.sha}
-Failed jobs from the sweep:
-{evidence}
-{unsettled_note}
-
-First re-verify that this failure and commit are still current on the default branch.
-If it was superseded or already fixed, leave the worktree unchanged and report that
-outcome. Keep any fix narrowly scoped and run the relevant checks.
-""".strip()
-
-
-def _gate_prompt(repo: str, failure: FailureEvidence) -> str:
-    """Build the self-sufficient prompt a LaunchApproval gate previews.
-
-    A LaunchApproval prompt gets none of the workspace/agent-name/wait_runners
-    scaffolding Axe used to inject around a proposal, so the prompt itself must
-    carry all of it.
-    """
-    header = f"#gh:{repo} %i:{_fix_agent_name(repo)} %w(runners=0)"
-    return f"{header}\n\n{_fix_prompt(repo, failure)}"
-
-
-def _gate_reason(repo: str, failure: FailureEvidence) -> str:
-    job_names = ", ".join(failure.failing_jobs[:3])
-    remaining_jobs = len(failure.failing_jobs) - 3
-    if remaining_jobs > 0:
-        job_names = f"{job_names} (+{remaining_jobs} more)"
-    return _bounded(f"CI red in {repo} at {failure.sha[:7]}: {job_names}")
-
-
 def _dry_run_mode() -> str:
     value = os.getenv("SASE_CHOP_DRY_RUN")
     if value is None:
@@ -1152,15 +1025,14 @@ def _new_counters(repo_count: int) -> dict[str, int]:
         "red": 0,
         "pending": 0,
         "errors": 0,
-        "agents_running": 0,
-        "fix_gated": 0,
-        "fix_suppressed": 0,
-        "red_debounce_suppressed": 0,
-        "gate_pending_suppressed": 0,
-        "gate_errors": 0,
         "release_candidates": 0,
         "merged": 0,
         "merge_skipped": 0,
+        "notifications_attempted": 0,
+        "notifications_sent": 0,
+        "notifications_failed": 0,
+        "reports_published": 0,
+        "reports_failed": 0,
     }
 
 
@@ -1196,225 +1068,224 @@ def _extract_release_version(title: str) -> str:
     return match.group(1) if match is not None else "-"
 
 
-def _empty_release_ledger() -> JsonObject:
-    return {"version": 1, "merges": [], "announced_pending": {}}
+def _empty_state() -> JsonObject:
+    return {"version": 1, "failures": {}, "releases": []}
 
 
-def _load_release_ledger(invocation: ChopInvocation, now: datetime) -> JsonObject:
-    path = Path(invocation.context.state_dir) / RELEASE_LEDGER_FILE_NAME
+def _release_key(repo: str, number: int) -> str:
+    return f"{repo}#{number}"
+
+
+def _legacy_release_rows(invocation: ChopInvocation, now: datetime) -> list[JsonObject]:
+    path = Path(invocation.context.state_dir) / LEGACY_RELEASE_LEDGER_FILE_NAME
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return _empty_release_ledger()
-    if not isinstance(raw, dict) or raw.get("version") != 1:
-        return _empty_release_ledger()
-
-    raw_merges = raw.get("merges")
-    if not isinstance(raw_merges, list):
-        return _empty_release_ledger()
-    cutoff = now - timedelta(days=RELEASE_LEDGER_RETENTION_DAYS)
-    merges: list[JsonObject] = []
-    for row in raw_merges:
+        return []
+    if (
+        not isinstance(raw, dict)
+        or raw.get("version") != 1
+        or not isinstance(raw.get("merges"), list)
+    ):
+        return []
+    rows: list[JsonObject] = []
+    cutoff = now - timedelta(days=STATE_RETENTION_DAYS)
+    for row in raw["merges"]:
         if not isinstance(row, dict):
             continue
         try:
             repo = _repo(row.get("repo"))
             number = row.get("number")
             if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-                raise CiWatchError("invalid release ledger PR number")
+                raise CiWatchError("invalid release number")
             url = _required_string(row, "url")
             if not url.startswith("https://github.com/"):
-                raise CiWatchError("invalid release ledger URL")
+                raise CiWatchError("invalid release URL")
             head_oid = _sha(row.get("head_oid"))
             version = _bounded(_required_string(row, "version"), limit=80)
-            generator = _bounded(_required_string(row, "generator"), limit=80)
-            merged_at = _required_string(row, "merged_at")
-            parsed_merged_at = _parse_timestamp(merged_at).astimezone(now.tzinfo)
+            submitted_at = _required_string(row, "merged_at")
+            parsed = _parse_timestamp(submitted_at).astimezone(now.tzinfo)
         except (CiWatchError, ValueError):
             continue
-        if parsed_merged_at < cutoff:
+        if parsed < cutoff:
             continue
-        merges.append(
+        rows.append(
             {
                 "repo": repo,
                 "number": number,
                 "url": url,
                 "head_oid": head_oid,
                 "version": version,
-                "generator": generator,
-                "merged_at": merged_at,
+                "title": f"release {version}",
+                "target_branch": "master",
+                "submitted_at": submitted_at,
+                "notification_sent": True,
+                "outcome": "legacy_merge",
             }
         )
-
-    announced: JsonObject = {}
-    raw_announced = raw.get("announced_pending")
-    if isinstance(raw_announced, dict):
-        for key, row in raw_announced.items():
-            if not isinstance(key, str) or not isinstance(row, dict):
-                continue
-            consecutive_ticks = row.get("consecutive_ticks")
-            notified = row.get("notified")
-            if (
-                not isinstance(consecutive_ticks, int)
-                or isinstance(consecutive_ticks, bool)
-                or consecutive_ticks < 0
-                or not isinstance(notified, bool)
-            ):
-                continue
-            announced[_bounded(key, limit=MAX_TEXT)] = {
-                "consecutive_ticks": consecutive_ticks,
-                "notified": notified,
-            }
-    return {
-        "version": 1,
-        "merges": merges[-MAX_LEDGER_MERGES:],
-        "announced_pending": announced,
-    }
+    return rows[-MAX_STATE_RELEASES:]
 
 
-def _write_release_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> None:
-    destination = Path(invocation.context.state_dir) / RELEASE_LEDGER_FILE_NAME
-    _atomic_write_json(destination, ledger)
-
-
-def _empty_fix_ledger() -> JsonObject:
-    return {"version": 2, "repos": {}, "gates": {}}
-
-
-def _fix_key_repo(value: str) -> str:
-    parts = value.split(":")
-    if (
-        len(parts) != 4
-        or parts[0] != "ci_fix"
-        or re.fullmatch(r"[0-9a-f]{16}", parts[2]) is None
-        or re.fullmatch(r"e(?:0|[1-9][0-9]*)", parts[3]) is None
-    ):
-        raise CiWatchError("invalid CI fix dedupe key")
-    return _repo(parts[1])
-
-
-def _prune_gated_fixes(
-    gates: Mapping[str, Any],
-    now: datetime,
-    repos: Sequence[str],
-) -> dict[str, JsonObject]:
-    allowed_repos = set(repos)
-    cutoff = now - timedelta(days=FIX_LEDGER_RETENTION_DAYS)
-    rows: list[tuple[datetime, str, JsonObject]] = []
-    for key, row in gates.items():
-        if not isinstance(key, str) or not isinstance(row, dict):
-            continue
-        request_id = row.get("request_id")
-        created_at = row.get("created_at")
-        if (request_id is not None and not isinstance(request_id, str)) or not isinstance(
-            created_at, str
-        ):
-            continue
-        try:
-            repo = _fix_key_repo(key)
-            parsed = _parse_timestamp(created_at).astimezone(now.tzinfo)
-        except (CiWatchError, ValueError):
-            continue
-        if repo not in allowed_repos or parsed < cutoff:
-            continue
-        rows.append((parsed, key, {"request_id": request_id, "created_at": created_at}))
-    rows.sort(key=lambda row: (row[0], row[1]))
-    return {key: row for _, key, row in rows[-MAX_GATED_FIXES:]}
-
-
-def _load_fix_ledger(
-    invocation: ChopInvocation,
-    now: datetime,
-    configured_repos: Sequence[str],
-) -> JsonObject:
-    path = Path(invocation.context.state_dir) / FIX_LEDGER_FILE_NAME
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return _empty_fix_ledger()
-    if not isinstance(raw, dict) or raw.get("version") != 2:
-        return _empty_fix_ledger()
-    raw_repos = raw.get("repos")
-    raw_gates = raw.get("gates")
-    if not isinstance(raw_repos, dict) or not isinstance(raw_gates, dict):
-        return _empty_fix_ledger()
-
-    allowed_repos = set(configured_repos)
-    repos: dict[str, JsonObject] = {}
-    for repo, row in raw_repos.items():
-        if not isinstance(repo, str) or not isinstance(row, dict):
-            continue
-        episode = row.get("episode")
-        red = row.get("red")
-        try:
-            normalized_repo = _repo(repo)
-        except CiWatchError:
-            continue
-        if (
-            normalized_repo not in allowed_repos
-            or not isinstance(episode, int)
-            or isinstance(episode, bool)
-            or episode < 0
-            or not isinstance(red, bool)
-        ):
-            continue
-        repos[normalized_repo] = {"episode": episode, "red": red}
-
-    return {
-        "version": 2,
-        "repos": repos,
-        "gates": _prune_gated_fixes(raw_gates, now, configured_repos),
-    }
-
-
-def _write_fix_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> None:
-    destination = Path(invocation.context.state_dir) / FIX_LEDGER_FILE_NAME
-    _atomic_write_json(destination, ledger)
-
-
-def _load_streaks(invocation: ChopInvocation) -> dict[str, tuple[tuple[str, ...], int]]:
-    path = Path(invocation.context.state_dir) / STREAK_FILE_NAME
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(raw, dict) or raw.get("version") != 1:
-        return {}
-    repos = raw.get("repositories")
-    if not isinstance(repos, dict):
-        return {}
-    streaks: dict[str, tuple[tuple[str, ...], int]] = {}
-    for repo, row in repos.items():
-        if not isinstance(repo, str) or not isinstance(row, dict):
-            continue
-        fingerprint = row.get("fingerprint")
-        streak = row.get("streak")
-        if (
-            not isinstance(fingerprint, list)
-            or not fingerprint
-            or not all(isinstance(name, str) and name for name in fingerprint)
-            or not isinstance(streak, int)
-            or isinstance(streak, bool)
-            or streak < 1
-        ):
-            continue
-        streaks[repo] = (tuple(sorted(set(fingerprint))), streak)
-    return streaks
-
-
-def _write_streaks(
-    invocation: ChopInvocation,
-    streaks: Mapping[str, tuple[tuple[str, ...], int]],
-) -> None:
-    destination = Path(invocation.context.state_dir) / STREAK_FILE_NAME
+def _failure_to_json(failure: FailureEvidence) -> JsonObject:
     payload: JsonObject = {
-        "version": 1,
-        "repositories": {
-            repo: {"fingerprint": list(fingerprint), "streak": streak}
-            for repo, (fingerprint, streak) in sorted(streaks.items())
-        },
+        "sha": failure.sha,
+        "head_unsettled": failure.head_unsettled,
+        "jobs": [
+            {
+                "workflow": job.workflow,
+                "job": job.job,
+                "conclusion": job.conclusion,
+                "url": job.url,
+                "steps": list(job.steps),
+            }
+            for job in failure.jobs
+        ],
     }
-    _atomic_write_json(destination, payload)
+    if failure.current_head_sha is not None:
+        payload["current_head_sha"] = failure.current_head_sha
+    return payload
+
+
+def _failure_from_json(value: Mapping[str, Any]) -> FailureEvidence:
+    sha = _sha(value.get("sha"))
+    jobs_value = value.get("jobs")
+    if not isinstance(jobs_value, list) or not jobs_value:
+        raise CiWatchError("failure evidence has no jobs")
+    jobs: list[FailingJobEvidence] = []
+    for row in jobs_value:
+        if not isinstance(row, dict):
+            raise CiWatchError("failure job is not an object")
+        steps = row.get("steps", [])
+        if not isinstance(steps, list) or not all(isinstance(step, str) for step in steps):
+            raise CiWatchError("failure job has invalid steps")
+        url = row.get("url")
+        if url is not None and _safe_github_url(url) is None:
+            raise CiWatchError("failure job has invalid URL")
+        jobs.append(
+            FailingJobEvidence(
+                workflow=_bounded(_required_string(row, "workflow"), limit=120),
+                job=_bounded(_required_string(row, "job"), limit=120),
+                conclusion=_bounded(_required_string(row, "conclusion"), limit=80),
+                url=cast(str | None, url),
+                steps=tuple(_bounded(step, limit=120) for step in steps[:MAX_STEPS_PER_JOB]),
+            )
+        )
+    raw_current_head_sha = value.get("current_head_sha")
+    current_head_sha = _sha(raw_current_head_sha) if raw_current_head_sha is not None else None
+    return FailureEvidence(
+        sha=sha,
+        jobs=tuple(jobs),
+        head_unsettled=value.get("head_unsettled") is True,
+        current_head_sha=current_head_sha,
+    )
+
+
+def _sanitize_failure_row(repo: str, row: Mapping[str, Any]) -> JsonObject | None:
+    fingerprint = row.get("fingerprint")
+    notification_sent = row.get("notification_sent")
+    evidence = row.get("evidence")
+    last_seen = row.get("last_seen")
+    if (
+        not isinstance(fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{16}", fingerprint)
+        or not isinstance(notification_sent, bool)
+        or not isinstance(evidence, dict)
+        or not isinstance(last_seen, str)
+    ):
+        return None
+    try:
+        _repo(repo)
+        _parse_timestamp(last_seen)
+        failure = _failure_from_json(evidence)
+    except (CiWatchError, ValueError):
+        return None
+    return {
+        "fingerprint": fingerprint,
+        "notification_sent": notification_sent,
+        "last_seen": last_seen,
+        "evidence": _failure_to_json(failure),
+    }
+
+
+def _sanitize_release_row(row: Mapping[str, Any], now: datetime) -> JsonObject | None:
+    try:
+        repo = _repo(row.get("repo"))
+        number = row.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            raise CiWatchError("invalid release number")
+        url = _required_string(row, "url")
+        if not url.startswith("https://github.com/"):
+            raise CiWatchError("invalid release URL")
+        head_oid = _sha(row.get("head_oid"))
+        title = _bounded(_required_string(row, "title"))
+        version = _bounded(_required_string(row, "version"), limit=80)
+        target_branch = _branch(row.get("target_branch"))
+        submitted_at = _required_string(row, "submitted_at")
+        parsed = _parse_timestamp(submitted_at).astimezone(now.tzinfo)
+        notification_sent = row.get("notification_sent")
+        if not isinstance(notification_sent, bool):
+            raise CiWatchError("invalid notification flag")
+        outcome = _bounded(row.get("outcome", "squash_merge_submitted"), limit=80)
+    except (CiWatchError, ValueError):
+        return None
+    if parsed < now - timedelta(days=STATE_RETENTION_DAYS):
+        return None
+    sanitized: JsonObject = {
+        "repo": repo,
+        "number": number,
+        "url": url,
+        "head_oid": head_oid,
+        "title": title,
+        "version": version,
+        "target_branch": target_branch,
+        "submitted_at": submitted_at,
+        "notification_sent": notification_sent,
+        "outcome": outcome,
+    }
+    notified_at = row.get("notified_at")
+    if isinstance(notified_at, str):
+        with suppress(ValueError):
+            _parse_timestamp(notified_at)
+            sanitized["notified_at"] = notified_at
+    return sanitized
+
+
+def _load_state(invocation: ChopInvocation, now: datetime, repos: Sequence[str]) -> JsonObject:
+    path = Path(invocation.context.state_dir) / STATE_FILE_NAME
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = None
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        state = _empty_state()
+        state["releases"] = _legacy_release_rows(invocation, now)
+        return state
+    allowed = set(repos)
+    failures: JsonObject = {}
+    raw_failures = raw.get("failures")
+    if isinstance(raw_failures, dict):
+        for repo, row in raw_failures.items():
+            if not isinstance(repo, str) or repo not in allowed or not isinstance(row, dict):
+                continue
+            sanitized = _sanitize_failure_row(repo, row)
+            if sanitized is not None:
+                failures[repo] = sanitized
+    releases: list[JsonObject] = []
+    raw_releases = raw.get("releases")
+    if isinstance(raw_releases, list):
+        for row in raw_releases:
+            if not isinstance(row, dict):
+                continue
+            sanitized = _sanitize_release_row(row, now)
+            if sanitized is not None:
+                releases.append(sanitized)
+    releases.sort(key=lambda row: _parse_timestamp(str(row["submitted_at"])))
+    return {"version": 1, "failures": failures, "releases": releases[-MAX_STATE_RELEASES:]}
+
+
+def _write_state(invocation: ChopInvocation, state: Mapping[str, Any]) -> None:
+    destination = Path(invocation.context.state_dir) / STATE_FILE_NAME
+    _atomic_write_json(destination, state)
 
 
 def _write_ledger(invocation: ChopInvocation, ledger: Mapping[str, Any]) -> str:
@@ -1453,69 +1324,32 @@ def _repo_state_presentation(state: RepoState) -> tuple[Tone, str]:
     }[state]
 
 
-def _repo_evidence(
-    repo: str,
-    state: RepoState,
-    heads: Mapping[str, BranchHead],
-    failures: Mapping[str, FailureEvidence],
-    ledger_repos: Mapping[str, JsonObject],
-    *,
-    red_debounce_ticks: int,
-) -> str:
-    row = ledger_repos.get(repo, {})
-    reason = str(row.get("reason", ""))
-    if reason in {
-        "red_debounce",
-        "fix_in_flight",
-        "fix_cap_reached",
-        "fix_disabled",
-        "agents_check_failed",
-        "gate_pending",
-        "already_gated",
-        "gate_failed",
-        "dry_run",
-    }:
-        return reason
-    if state is RepoState.GREEN and repo in heads:
-        return heads[repo].sha[:12]
-    if state is RepoState.RED and repo in failures:
-        jobs = " · ".join(failures[repo].failing_jobs)
-        streak = row.get("streak")
-        streak_text = (
-            f"streak {streak}/{red_debounce_ticks}"
-            if isinstance(streak, int)
-            else f"streak ?/{red_debounce_ticks}"
-        )
-        return _bounded(f"{jobs} · {streak_text}", limit=512)
-    return _bounded(reason or state.value, limit=512)
-
-
-def _release_tone(reason: str) -> Tone:
-    if reason == "merged":
-        return "ok"
-    if reason in {"no_release_pr", "dry_run"}:
-        return "muted"
-    return "warn"
+def _release_order(config: Config) -> list[str]:
+    ordered = [repo for repo in config.merge_order if repo in config.release_repositories]
+    ordered.extend(repo for repo in config.release_repositories if repo not in ordered)
+    return ordered
 
 
 _RELEASE_REASON_LABELS = {
     "eligible": "ready to merge",
     "default_branch_not_green": "base branch not green",
     "ambiguous_release_prs": "multiple release PRs",
-    "not_release_pr": "not a release PR",
+    "not_release_pr": "not a release-please PR",
     "release_pr_draft": "draft",
     "release_pr_wrong_base": "wrong base branch",
     "release_pr_not_mergeable": "not mergeable",
     "release_pr_not_clean": "merge state not clean",
     "release_pr_empty_rollup": "checks unavailable",
     "release_pr_checks_not_green": "checks not green",
-    "release_generator_busy": "release generator running",
+    "release_generator_busy": "release-please publish running",
     "release_pr_head_changed": "PR changed during merge",
+    "default_branch_changed": "default branch changed",
     "merge_cap_reached": "merge cap reached",
     "merge_disabled": "merge disabled",
     "merge_context_unavailable": "merge context unavailable",
     "dry_run": "dry run",
     "merge_failed": "merge failed",
+    "merged": "merged",
 }
 _NON_BLOCKING_RELEASE_REASONS = frozenset({"eligible", "release_generator_busy"})
 
@@ -1525,6 +1359,8 @@ def _humanize_release_reason(reason: str) -> str:
 
 
 def _release_reason_tone(reason: str) -> Tone:
+    if reason == "merged":
+        return "ok"
     if reason == "no_release_pr":
         return "muted"
     if reason in _NON_BLOCKING_RELEASE_REASONS:
@@ -1532,146 +1368,20 @@ def _release_reason_tone(reason: str) -> Tone:
     return "error"
 
 
-def _format_release_age(created_at: str, now: datetime) -> str:
+def _format_timestamp(value: str, now: datetime) -> str:
     try:
-        delta = max(now - _parse_timestamp(created_at).astimezone(now.tzinfo), timedelta())
+        parsed = _parse_timestamp(value).astimezone(now.tzinfo)
     except ValueError:
         return "-"
-    seconds = int(delta.total_seconds())
-    if seconds < 60:
-        return "<1m"
-    if seconds < 3600:
-        return f"{seconds // 60}m"
-    if seconds < 86400:
-        return f"{seconds // 3600}h"
-    return f"{seconds // 86400}d"
+    return parsed.strftime("%m-%d %H:%M")
 
 
-def _release_order(config: Config) -> list[str]:
-    ordered = [repo for repo in config.merge_order if repo in config.release_repositories]
-    ordered.extend(repo for repo in config.release_repositories if repo not in ordered)
-    return ordered
-
-
-def _build_release_report(
-    config: Config,
-    release_ledger: Mapping[str, Any],
-    observations: Mapping[str, ReleaseObservation],
-    decisions: Mapping[str, str],
-    now: datetime,
-    merged_keys: set[str],
-) -> ChopReport:
-    raw_merges = release_ledger.get("merges")
-    merges = (
-        [row for row in raw_merges if isinstance(row, dict)] if isinstance(raw_merges, list) else []
-    )
-    recent_cutoff = now - timedelta(days=RELEASE_REPORT_WINDOW_DAYS)
-    recent = [
-        row
-        for row in merges
-        if isinstance(row.get("merged_at"), str)
-        and _parse_timestamp(str(row["merged_at"])).astimezone(now.tzinfo) >= recent_cutoff
-    ]
-    recent.sort(
-        key=lambda row: _parse_timestamp(str(row["merged_at"])),
-        reverse=True,
-    )
-    merged_today = sum(
-        _parse_timestamp(str(row["merged_at"])).astimezone(now.tzinfo).date() == now.date()
-        for row in merges
-    )
-
-    pending_repos = [
-        repo
-        for repo in _release_order(config)
-        if observations[repo].numbers
-        and not all(
-            f"{repo}#{number}" in merged_keys for number in observations[repo].numbers or ()
-        )
-    ]
-    blocked = sum(
-        decisions.get(repo, "") not in _NON_BLOCKING_RELEASE_REASONS for repo in pending_repos
-    )
-    headline_tone: Tone = "error" if blocked else "warn" if pending_repos else "ok"
-    report = ChopReport(title="RELEASES").headline(
-        f"{merged_today} merged today · {len(pending_repos)} pending · {blocked} blocked",
-        tone=headline_tone,
-    )
-
-    report.heading("RECENT")
-    recent_rows = report.rows(columns=("REPOSITORY", "PR", "VERSION", "MERGED"))
-    for row in recent[:8]:
-        merged_at = _parse_timestamp(str(row["merged_at"])).astimezone(now.tzinfo)
-        recent_rows.row(
-            (
-                str(row["repo"]),
-                f"#{row['number']}",
-                str(row["version"]),
-                merged_at.strftime("%m-%d %H:%M"),
-            ),
-            tone="ok",
-            glyph="✓",
-        )
-    if not recent:
-        recent_rows.row(("-", "-", "-", "no recent releases"), tone="muted", glyph="·")
-
-    report.heading("PENDING")
-    pending_rows = report.rows(columns=("REPOSITORY", "PR", "STATE", "AGE"))
-    for repo in _release_order(config):
-        observation = observations[repo]
-        unmerged_numbers = [
-            number for number in observation.numbers or () if f"{repo}#{number}" not in merged_keys
-        ]
-        if observation.numbers is None:
-            pending_rows.row(
-                (
-                    repo,
-                    "-",
-                    _humanize_release_reason(observation.error or "observation failed"),
-                    "-",
-                ),
-                tone="error",
-                glyph="!",
-            )
-            continue
-        if not unmerged_numbers:
-            pending_rows.row((repo, "-", "no release PR", "-"), tone="muted", glyph="·")
-            continue
-        number = unmerged_numbers[0]
-        pr = next((candidate for candidate in observation.prs if candidate.number == number), None)
-        reason = decisions.get(repo, observation.error or "observation failed")
-        tone = _release_reason_tone(reason)
-        pending_rows.row(
-            (
-                repo,
-                f"#{number}",
-                _humanize_release_reason(reason),
-                _format_release_age(pr.created_at, now) if pr is not None else "-",
-            ),
-            tone=tone,
-            glyph="◆" if tone == "warn" else "▲",
-        )
-
-    report.divider().kv(
-        {
-            "updated": now.strftime("%m-%d %H:%M"),
-            "window": f"{RELEASE_REPORT_WINDOW_DAYS}d",
-            "merges recorded": str(len(merges)),
-        },
-        tone="muted",
-    )
-    return report
-
-
-def _publish_release_report(invocation: ChopInvocation, report: ChopReport) -> bool:
-    destination = Path(invocation.context.state_dir).resolve() / RELEASE_REPORT_FILE_NAME
-    try:
-        document = validate_chop_report(report.to_dict())
-        _atomic_write_json(destination, document)
-    except (OSError, TypeError, ValueError) as error:
-        invocation.logger.warning(f"{CHOP_NAME}: release report publish skipped: {_bounded(error)}")
-        return False
-    return True
+def _failure_summary(failure: FailureEvidence) -> str:
+    labels = [job.label for job in failure.jobs[:2]]
+    remaining = len(failure.jobs) - len(labels)
+    if remaining > 0:
+        labels.append(f"+{remaining} more")
+    return _bounded("; ".join(labels), limit=512)
 
 
 def _build_ci_watch_report(
@@ -1680,9 +1390,11 @@ def _build_ci_watch_report(
     states: Mapping[str, RepoState],
     heads: Mapping[str, BranchHead],
     failures: Mapping[str, FailureEvidence],
-    ledger_repos: Mapping[str, JsonObject],
-    release_plans: Sequence[MergePlan],
+    release_observations: Mapping[str, ReleaseObservation],
+    release_decisions: Mapping[str, str],
+    state: Mapping[str, Any],
     mode: str,
+    now: datetime,
 ) -> ChopReport:
     report = start_report("CI WATCH")
     headline = (
@@ -1691,84 +1403,321 @@ def _build_ci_watch_report(
     )
     headline_tone: Tone = (
         "error"
-        if counters["red"]
+        if counters["red"] or counters["errors"]
         else "warn"
-        if counters["pending"] or counters["errors"]
+        if counters["pending"]
         else "ok"
     )
-    report.headline(headline, tone=headline_tone).heading("REPOSITORIES")
-    repositories = report.rows(columns=("REPOSITORY", "STATE", "EVIDENCE"))
+    report.headline(headline, tone=headline_tone)
+
+    report.heading("REPOSITORIES")
+    repositories = report.rows(columns=("REPOSITORY", "STATE", "DEFAULT", "EVIDENCE"))
     for repo in config.repos:
-        state = states[repo]
-        tone, glyph = _repo_state_presentation(state)
+        state_value = states[repo]
+        tone, glyph = _repo_state_presentation(state_value)
+        head = heads.get(repo)
+        evidence = str(state_value.value)
+        if state_value is RepoState.GREEN and head is not None:
+            evidence = head.sha[:12]
+        elif state_value is RepoState.RED and repo in failures:
+            evidence = _failure_summary(failures[repo])
         repositories.row(
             (
                 repo,
-                state.value,
-                _repo_evidence(
-                    repo,
-                    state,
-                    heads,
-                    failures,
-                    ledger_repos,
-                    red_debounce_ticks=config.red_debounce_ticks,
-                ),
+                state_value.value,
+                f"{head.branch}@{head.sha[:12]}" if head is not None else "-",
+                evidence,
             ),
             tone=tone,
             glyph=glyph,
         )
 
-    if config.release_repositories:
-        plans = {plan.repo: plan for plan in release_plans}
-        report.heading("RELEASE")
-        releases = report.rows(columns=("REPOSITORY", "PR", "DECISION"))
-        release_order = [repo for repo in config.merge_order if repo in config.release_repositories]
-        release_order.extend(
-            repo for repo in config.release_repositories if repo not in release_order
+    report.heading("FAILING JOBS")
+    failing_rows = report.rows(columns=("REPOSITORY", "SHA", "JOB", "STEPS", "URL"))
+    for repo in config.repos:
+        failure = failures.get(repo)
+        if failure is None:
+            continue
+        for job in failure.jobs:
+            failing_rows.row(
+                (
+                    repo,
+                    failure.sha[:12],
+                    job.label,
+                    ", ".join(job.steps) if job.steps else "-",
+                    job.url or "-",
+                ),
+                tone="error",
+                glyph="▲",
+            )
+        if failure.head_unsettled and failure.current_head_sha is not None:
+            failing_rows.row(
+                (
+                    repo,
+                    failure.current_head_sha[:12],
+                    "current HEAD still unsettled",
+                    f"settled failure remains at {failure.sha[:12]}",
+                    "-",
+                ),
+                tone="warn",
+                glyph="◆",
+            )
+    if not failures:
+        failing_rows.row(("-", "-", "no current failures", "-", "-"), tone="muted", glyph="·")
+
+    report.heading("RELEASES")
+    release_rows = report.rows(columns=("REPOSITORY", "PR", "DECISION", "HEAD"))
+    for repo in _release_order(config):
+        observation = release_observations.get(repo)
+        reason = release_decisions.get(repo, "not_observed")
+        if observation is None or observation.numbers is None:
+            release_rows.row((repo, "-", _humanize_release_reason(reason), "-"), tone="error")
+            continue
+        if not observation.numbers:
+            release_rows.row((repo, "-", "no release PR", "-"), tone="muted", glyph="·")
+            continue
+        pr = observation.prs[0] if observation.prs else None
+        release_rows.row(
+            (
+                repo,
+                f"#{observation.numbers[0]}",
+                _humanize_release_reason(reason),
+                pr.head_oid[:12] if pr is not None else "-",
+            ),
+            tone=_release_reason_tone(reason),
+            glyph="✓" if reason == "merged" else "◆",
         )
-        for repo in release_order:
-            ledger_row = ledger_repos.get(repo, {})
-            reason = str(
-                ledger_row.get("release_reason", ledger_row.get("reason", states[repo].value))
-            )
-            pr_number = ledger_row.get("merged_pr") or ledger_row.get("planned_pr")
-            if pr_number is None and repo in plans:
-                pr_number = plans[repo].pr.number
-            releases.row(
-                (repo, f"#{pr_number}" if pr_number is not None else "-", reason),
-                tone=_release_tone(reason),
-            )
+
+    report.heading("RECENT SUBMISSIONS")
+    recent_rows = report.rows(columns=("REPOSITORY", "PR", "VERSION", "SUBMITTED", "NOTICE"))
+    raw_releases = state.get("releases")
+    releases = (
+        [row for row in raw_releases if isinstance(row, dict)]
+        if isinstance(raw_releases, list)
+        else []
+    )
+    recent_cutoff = now - timedelta(days=REPORT_RECENT_DAYS)
+    recent = [
+        row
+        for row in releases
+        if isinstance(row.get("submitted_at"), str)
+        and _parse_timestamp(str(row["submitted_at"])).astimezone(now.tzinfo) >= recent_cutoff
+    ]
+    recent.sort(key=lambda row: _parse_timestamp(str(row["submitted_at"])), reverse=True)
+    for row in recent[:8]:
+        recent_rows.row(
+            (
+                str(row.get("repo", "-")),
+                f"#{row.get('number')}",
+                str(row.get("version", "-")),
+                _format_timestamp(str(row.get("submitted_at", "")), now),
+                "sent" if row.get("notification_sent") is True else "pending",
+            ),
+            tone="ok" if row.get("notification_sent") is True else "warn",
+            glyph="✓" if row.get("notification_sent") is True else "◆",
+        )
+    if not recent:
+        recent_rows.row(("-", "-", "-", "none", "-"), tone="muted", glyph="·")
 
     add_facts_footer(
         report,
-        {"mode": mode.replace("_", " ")},
-        tone="neutral" if mode == "live" else "warn",
-    )
-    report.kv(
         {
-            "agents running": str(counters["agents_running"]),
-            "fix cap": str(config.max_fixes),
-            "merge cap": str(config.max_merges),
-            "debounce ticks": str(config.red_debounce_ticks),
+            "mode": mode.replace("_", " "),
+            "updated": now.strftime("%m-%d %H:%M"),
+            "release cap": str(config.max_merges),
+            "legacy report": LEGACY_RELEASE_REPORT_FILE_NAME,
         },
-        tone="muted",
+        tone="neutral" if mode == "live" else "warn",
     )
     return report
 
 
-def _any_gate_pending(launch_gate: LaunchGateClient, gates: Mapping[str, JsonObject]) -> bool:
-    """Return whether any recorded gate is still pending, bounding the polling work."""
-    checked = 0
-    for row in gates.values():
-        if checked >= MAX_GATE_POLLS_PER_TICK:
-            break
-        request_id = row.get("request_id")
-        if not isinstance(request_id, str) or not request_id.strip():
+def _publish_report(invocation: ChopInvocation, report: ChopReport) -> Path:
+    destination = Path(invocation.context.state_dir).resolve() / REPORT_FILE_NAME
+    document = validate_chop_report(report.to_dict())
+    _atomic_write_json(destination, document)
+    return destination
+
+
+def _release_notification_notes(row: Mapping[str, Any]) -> list[str]:
+    return [
+        f"Release submitted: {row['repo']} #{row['number']} {row.get('version', '-')}",
+        (
+            f"Target {row.get('target_branch', '-')} · "
+            f"head {str(row.get('head_oid', ''))[:12]} · {row.get('outcome', 'merged')}"
+        ),
+        _bounded(row.get("title", "-"), limit=512),
+        str(row.get("url", "-")),
+    ]
+
+
+def _failure_notification_notes(
+    repo: str,
+    failure: FailureEvidence,
+    head: BranchHead | None,
+) -> list[str]:
+    branch = head.branch if head is not None else "default"
+    notes = [f"CI failure: {repo} {branch}@{failure.sha[:12]}"]
+    for job in failure.jobs[:MAX_FAILURE_JOBS_PER_NOTIFICATION]:
+        notes.append(job.label)
+        if job.steps:
+            notes.append("Steps: " + ", ".join(job.steps))
+        if job.url:
+            notes.append(job.url)
+    remaining = len(failure.jobs) - MAX_FAILURE_JOBS_PER_NOTIFICATION
+    if remaining > 0:
+        notes.append(f"+{remaining} more failing job{'s' if remaining != 1 else ''}")
+    if failure.head_unsettled and failure.current_head_sha is not None:
+        notes.append(
+            "Settled failure is older than current HEAD: "
+            f"{failure.sha[:12]} red, {failure.current_head_sha[:12]} still unsettled"
+        )
+    return notes
+
+
+def _notification_action(report_path: Path | None) -> tuple[str | None, dict[str, str] | None]:
+    if report_path is None:
+        return None, None
+    return "ViewReport", {"report_path": str(report_path), "report_title": "CI WATCH"}
+
+
+def _update_failure_state(
+    state: JsonObject,
+    failures: Mapping[str, FailureEvidence],
+    states: Mapping[str, RepoState],
+    now: datetime,
+) -> None:
+    raw_failures = state.setdefault("failures", {})
+    if not isinstance(raw_failures, dict):
+        raw_failures = {}
+        state["failures"] = raw_failures
+    for repo, repo_state in states.items():
+        if repo_state is not RepoState.RED:
+            raw_failures.pop(repo, None)
             continue
-        checked += 1
-        if launch_gate.status(request_id) == "pending":
-            return True
-    return False
+        failure = failures[repo]
+        fingerprint = failure.fingerprint_key
+        previous = raw_failures.get(repo)
+        notification_sent = (
+            isinstance(previous, dict)
+            and previous.get("fingerprint") == fingerprint
+            and previous.get("notification_sent") is True
+        )
+        raw_failures[repo] = {
+            "fingerprint": fingerprint,
+            "notification_sent": notification_sent,
+            "last_seen": now.isoformat(),
+            "evidence": _failure_to_json(failure),
+        }
+
+
+def _append_release_record(
+    state: JsonObject,
+    repo: str,
+    pr: ReleasePr,
+    now: datetime,
+) -> None:
+    raw_releases = state.setdefault("releases", [])
+    if not isinstance(raw_releases, list):
+        raw_releases = []
+        state["releases"] = raw_releases
+    key = _release_key(repo, pr.number)
+    raw_releases[:] = [
+        row
+        for row in raw_releases
+        if not (
+            isinstance(row, dict)
+            and isinstance(row.get("repo"), str)
+            and isinstance(row.get("number"), int)
+            and _release_key(row["repo"], row["number"]) == key
+        )
+    ]
+    raw_releases.append(
+        {
+            "repo": repo,
+            "number": pr.number,
+            "url": pr.url,
+            "head_oid": pr.head_oid,
+            "title": pr.title,
+            "version": _extract_release_version(pr.title),
+            "target_branch": pr.base_ref_name,
+            "submitted_at": now.isoformat(),
+            "notification_sent": False,
+            "outcome": "squash_merge_submitted",
+        }
+    )
+    raw_releases[:] = raw_releases[-MAX_STATE_RELEASES:]
+
+
+def _send_required_notifications(
+    *,
+    invocation: ChopInvocation,
+    notifier: SaseNotifier,
+    state: JsonObject,
+    failures: Mapping[str, FailureEvidence],
+    heads: Mapping[str, BranchHead],
+    report_path: Path | None,
+    now: datetime,
+    counters: dict[str, int],
+) -> list[str]:
+    errors: list[str] = []
+    action, action_data = _notification_action(report_path)
+    raw_releases = state.get("releases")
+    releases = raw_releases if isinstance(raw_releases, list) else []
+    for row in releases:
+        if not isinstance(row, dict) or row.get("notification_sent") is True:
+            continue
+        counters["notifications_attempted"] += 1
+        try:
+            notifier.notify(
+                _release_notification_notes(row),
+                icon="🚢",
+                tags=("ci", "release"),
+                action=action,
+                action_data=action_data,
+            )
+        except CiWatchError as error:
+            counters["notifications_failed"] += 1
+            errors.append(str(error))
+            continue
+        counters["notifications_sent"] += 1
+        row["notification_sent"] = True
+        row["notified_at"] = now.isoformat()
+
+    raw_failures = state.get("failures")
+    failure_rows = raw_failures if isinstance(raw_failures, dict) else {}
+    for repo, row in failure_rows.items():
+        if (
+            not isinstance(repo, str)
+            or not isinstance(row, dict)
+            or row.get("notification_sent") is True
+            or repo not in failures
+        ):
+            continue
+        failure = failures[repo]
+        counters["notifications_attempted"] += 1
+        try:
+            notifier.notify(
+                _failure_notification_notes(repo, failure, heads.get(repo)),
+                icon="🚨",
+                tags=("ci", "failure"),
+                action=action,
+                action_data=action_data,
+            )
+        except CiWatchError as error:
+            counters["notifications_failed"] += 1
+            errors.append(str(error))
+            continue
+        counters["notifications_sent"] += 1
+        row["notification_sent"] = True
+        row["notified_at"] = now.isoformat()
+
+    if counters["notifications_sent"]:
+        try:
+            _write_state(invocation, state)
+        except OSError as error:
+            errors.append(f"state write failed after notification: {_bounded(error)}")
+    return errors
 
 
 def build_ci_watch_result(
@@ -1776,22 +1725,16 @@ def build_ci_watch_result(
     *,
     actstat: ActstatClient | None = None,
     github: GitHubReader | None = None,
-    agents: AgentsGate | None = None,
-    launch_gate: LaunchGateClient | None = None,
+    notifier: SaseNotifier | None = None,
     clock: Callable[[], datetime] = _local_now,
 ) -> ChopResultBuilder:
     config = Config.from_invocation(invocation)
     actstat = actstat or ActstatClient(config.actstat_bin)
     github = github or GitHubReader(config.gh_bin)
-    agents = agents or AgentsGate(config.sase_bin)
-    launch_gate = launch_gate or LaunchGateClient(config.sase_bin)
+    notifier = notifier or SaseNotifier(config.sase_bin)
     now = clock().astimezone()
-    fix_ledger = _load_fix_ledger(invocation, now, config.repos)
-    fix_repos = cast(dict[str, JsonObject], fix_ledger["repos"])
-    fix_gates = cast(dict[str, JsonObject], fix_ledger["gates"])
-    release_ledger = _load_release_ledger(invocation, now)
-    release_merges = cast(list[JsonObject], release_ledger["merges"])
-    announced_pending = cast(dict[str, JsonObject], release_ledger["announced_pending"])
+    mode = _dry_run_mode()
+    state = _load_state(invocation, now, config.repos)
     observations = actstat.sweep(config.repos)
     counters = _new_counters(len(config.repos))
     states: dict[str, RepoState] = {}
@@ -1799,6 +1742,7 @@ def build_ci_watch_result(
     failures: dict[str, FailureEvidence] = {}
     ledger_repos: dict[str, JsonObject] = {}
     head_evidence_repos = 0
+    operational_errors: list[str] = []
 
     for repo in config.repos:
         observation = observations[repo]
@@ -1810,14 +1754,14 @@ def build_ci_watch_result(
                 else:
                     decision = RepoDecision(RepoState.ERROR, "missing_observation")
             except CiWatchError as error:
-                decision = RepoDecision(
-                    RepoState.ERROR,
-                    "missing_observation",
-                )
+                decision = RepoDecision(RepoState.ERROR, "missing_observation")
                 _mark(ledger_repos, repo, workflow_probe_error=str(error))
         elif observation.error or observation.commit is None:
-            state = classify_repo(observation)
-            decision = RepoDecision(state, _classification_reason(observation, state))
+            state_value = classify_repo(observation)
+            decision = RepoDecision(
+                state_value,
+                _classification_reason(observation, state_value),
+            )
         else:
             try:
                 head = github.default_branch_head(repo)
@@ -1829,168 +1773,45 @@ def build_ci_watch_result(
                         raise CiWatchError("HEAD evidence per-tick query limit reached")
                     head_evidence_repos += 1
                     head_evidence = github.head_ci_evidence(repo, head.sha)
-                decision = decide_repo(
-                    observation,
-                    head,
-                    head_evidence=head_evidence,
-                )
+                decision = decide_repo(observation, head, head_evidence=head_evidence)
             except CiWatchError as error:
                 decision = RepoDecision(RepoState.ERROR, str(error))
-        state = decision.state
-        reason = decision.reason
-        states[repo] = state
+        state_value = decision.state
+        states[repo] = state_value
         if decision.head is not None:
             heads[repo] = decision.head
         if decision.failure is not None:
             failures[repo] = decision.failure
-        counter_name = "errors" if state is RepoState.ERROR else state.value
+        counter_name = "errors" if state_value is RepoState.ERROR else state_value.value
         counters[counter_name] += 1
         _mark(
             ledger_repos,
             repo,
-            state=state,
-            reason=reason,
-            classification_reason=reason,
+            state=state_value,
+            reason=decision.reason,
+            classification_reason=decision.reason,
             head_sha=heads[repo].sha if repo in heads else None,
             failing_sha=decision.failure.sha if decision.failure is not None else None,
+            failing_jobs=(
+                [job.label for job in decision.failure.jobs]
+                if decision.failure is not None
+                else None
+            ),
+            failing_steps=(
+                {job.label: list(job.steps) for job in decision.failure.jobs if job.steps}
+                if decision.failure is not None
+                else None
+            ),
+            failing_job_fingerprint=(
+                decision.failure.fingerprint_key if decision.failure is not None else None
+            ),
             head_unsettled=(
                 decision.failure.head_unsettled if decision.failure is not None else None
             ),
+            current_head_sha=(
+                decision.failure.current_head_sha if decision.failure is not None else None
+            ),
         )
-
-    streaks = _load_streaks(invocation)
-    mature_red_repos: list[str] = []
-    for repo in config.repos:
-        state = states[repo]
-        fix_row = fix_repos.setdefault(repo, {"episode": 0, "red": False})
-        episode = cast(int, fix_row["episode"])
-        was_red = cast(bool, fix_row["red"])
-        if state is RepoState.RED:
-            was_red = True
-        elif state is RepoState.GREEN and was_red:
-            episode += 1
-            was_red = False
-        fix_repos[repo] = {"episode": episode, "red": was_red}
-        _mark(ledger_repos, repo, fix_episode=episode)
-
-        if state is not RepoState.RED:
-            streaks.pop(repo, None)
-            continue
-        failure = failures[repo]
-        previous = streaks.get(repo)
-        streak = (
-            previous[1] + 1 if previous is not None and previous[0] == failure.fingerprint else 1
-        )
-        streaks[repo] = (failure.fingerprint, streak)
-        _mark(
-            ledger_repos,
-            repo,
-            streak=streak,
-            failing_jobs=list(failure.failing_jobs),
-            failing_job_fingerprint=failure.fingerprint_key,
-        )
-        if streak < config.red_debounce_ticks:
-            counters["fix_suppressed"] += 1
-            counters["red_debounce_suppressed"] += 1
-            _mark(ledger_repos, repo, reason="red_debounce")
-            continue
-        mature_red_repos.append(repo)
-
-    mode = _dry_run_mode()
-    if mature_red_repos:
-        if not config.fix_enabled:
-            for repo in mature_red_repos:
-                counters["fix_suppressed"] += 1
-                _mark(ledger_repos, repo, reason="fix_disabled")
-        else:
-            try:
-                probe = agents.probe()
-            except CiWatchError:
-                probe = None
-                for repo in mature_red_repos:
-                    counters["fix_suppressed"] += 1
-                    _mark(ledger_repos, repo, reason="agents_check_failed")
-            if probe is not None:
-                counters["agents_running"] = probe.count
-                fix_agents = tuple(
-                    name for name in probe.names if name == "ci_fix" or name.startswith("ci_fix.")
-                )
-                if fix_agents:
-                    in_flight_names = [
-                        _bounded(name, limit=100) for name in fix_agents[:MAX_LEDGER_NAMES]
-                    ]
-                    for repo in mature_red_repos:
-                        counters["fix_suppressed"] += 1
-                        _mark(
-                            ledger_repos,
-                            repo,
-                            reason="fix_in_flight",
-                            in_flight_agents=in_flight_names,
-                        )
-                elif _any_gate_pending(launch_gate, fix_gates):
-                    for repo in mature_red_repos:
-                        counters["fix_suppressed"] += 1
-                        counters["gate_pending_suppressed"] += 1
-                        _mark(ledger_repos, repo, reason="gate_pending")
-                else:
-                    gate_attempts = 0
-                    for repo in mature_red_repos:
-                        failure = failures[repo]
-                        episode = cast(int, fix_repos[repo]["episode"])
-                        dedupe_key = f"ci_fix:{repo}:{failure.fingerprint_key}:e{episode}"
-                        if dedupe_key in fix_gates:
-                            counters["fix_suppressed"] += 1
-                            _mark(ledger_repos, repo, reason="already_gated")
-                            continue
-                        if gate_attempts >= config.max_fixes:
-                            counters["fix_suppressed"] += 1
-                            _mark(ledger_repos, repo, reason="fix_cap_reached")
-                            continue
-                        gate_attempts += 1
-                        if mode == "dry_run":
-                            counters["fix_suppressed"] += 1
-                            _mark(ledger_repos, repo, reason="dry_run")
-                            continue
-                        payload = {
-                            "schema_version": 1,
-                            "prompt": _gate_prompt(repo, failure),
-                            "reason": _gate_reason(repo, failure),
-                            "approval": "required",
-                            "max_slots": 1,
-                        }
-                        try:
-                            request_id = launch_gate.create(payload)
-                        except CiWatchError as error:
-                            counters["gate_errors"] += 1
-                            _mark(ledger_repos, repo, reason="gate_failed")
-                            ledger_repos[repo]["gate_error"] = _bounded(error)
-                            continue
-                        fix_gates[dedupe_key] = {
-                            "request_id": request_id,
-                            "created_at": now.isoformat(),
-                        }
-                        fix_ledger["gates"] = fix_gates
-                        try:
-                            _write_fix_ledger(invocation, fix_ledger)
-                        except OSError as error:
-                            invocation.logger.warning(
-                                f"{CHOP_NAME}: fix ledger write skipped: {_bounded(error)}"
-                            )
-                        counters["fix_gated"] += 1
-                        _mark(ledger_repos, repo, reason="fix_gated")
-                        ledger_repos[repo]["gate"] = {
-                            "agent_name": _fix_agent_name(repo),
-                            "dedupe_key": dedupe_key,
-                            "request_id": request_id,
-                        }
-                        streaks.pop(repo, None)
-
-    _write_streaks(invocation, streaks)
-    fix_ledger["gates"] = _prune_gated_fixes(fix_gates, now, config.repos)
-    try:
-        _write_fix_ledger(invocation, fix_ledger)
-    except OSError as error:
-        invocation.logger.warning(f"{CHOP_NAME}: fix ledger write skipped: {_bounded(error)}")
 
     release_observations: dict[str, ReleaseObservation] = {}
     remaining_details = MAX_RELEASE_PR_DETAILS
@@ -1998,11 +1819,7 @@ def build_ci_watch_result(
         try:
             numbers = tuple(github.release_pr_numbers(repo))
         except CiWatchError as error:
-            release_observations[repo] = ReleaseObservation(
-                repo,
-                None,
-                error=_bounded(error),
-            )
+            release_observations[repo] = ReleaseObservation(repo, None, error=_bounded(error))
             continue
         counters["release_candidates"] += len(numbers)
         candidates: list[ReleasePr] = []
@@ -2053,16 +1870,12 @@ def build_ci_watch_result(
                     states[repo],
                     head.branch,
                     release_observation.prs,
-                    generator_busy=github.generator_busy(
-                        repo,
-                        head.branch,
-                        config.release_repositories[repo],
-                    ),
+                    generator_busy=github.generator_busy(repo, head.branch),
                 )
             except CiWatchError as error:
                 reason = _bounded(error)
         release_decisions[repo] = reason
-        ledger_repos[repo]["release_reason"] = reason
+        ledger_repos.setdefault(repo, {})["release_reason"] = reason
         if states[repo] is RepoState.GREEN:
             ledger_repos[repo]["reason"] = reason
         if plan is None:
@@ -2071,263 +1884,162 @@ def build_ci_watch_result(
             continue
         release_plans.append(plan)
 
-    merged_keys: set[str] = set()
-    merged_notifications: list[tuple[str, ReleasePr]] = []
     for plan in release_plans:
         repo = plan.repo
         if counters["merged"] >= config.max_merges:
             counters["merge_skipped"] += 1
-            _mark(
-                ledger_repos,
-                repo,
-                reason="merge_cap_reached",
-                release_reason="merge_cap_reached",
-            )
-            continue
-        if not config.merge_enabled:
+            reason = "merge_cap_reached"
+        elif not config.merge_enabled:
             counters["merge_skipped"] += 1
+            reason = "merge_disabled"
+        elif mode == "unavailable":
+            counters["merge_skipped"] += 1
+            reason = "merge_context_unavailable"
+        elif mode == "dry_run":
+            counters["merge_skipped"] += 1
+            reason = "dry_run"
+        else:
+            reason = ""
+        if reason:
             _mark(
                 ledger_repos,
                 repo,
-                reason="merge_disabled",
-                release_reason="merge_disabled",
+                reason=reason,
+                release_reason=reason,
                 planned_pr=plan.pr.number,
             )
-            continue
-        if mode == "unavailable":
-            counters["merge_skipped"] += 1
-            _mark(
-                ledger_repos,
-                repo,
-                reason="merge_context_unavailable",
-                release_reason="merge_context_unavailable",
-                planned_pr=plan.pr.number,
-            )
-            continue
-        if mode == "dry_run":
-            counters["merge_skipped"] += 1
-            _mark(
-                ledger_repos,
-                repo,
-                reason="dry_run",
-                release_reason="dry_run",
-                planned_pr=plan.pr.number,
-            )
+            release_decisions[repo] = reason
             continue
         try:
-            current = github.release_pr(repo, plan.pr.number)
-            current_plan, current_reason = plan_release_merge(
-                repo,
-                RepoState.GREEN,
-                heads[repo].branch,
-                [current],
-                generator_busy=github.generator_busy(
-                    repo, heads[repo].branch, config.release_repositories[repo]
-                ),
-            )
-            if current_plan is None or current.head_oid != plan.pr.head_oid:
-                counters["merge_skipped"] += 1
-                _mark(
-                    ledger_repos,
+            current_head = github.default_branch_head(repo)
+            if current_head.sha != heads[repo].sha or current_head.branch != heads[repo].branch:
+                current_plan = None
+                current_reason = "default_branch_changed"
+                current = plan.pr
+            else:
+                current = github.release_pr(repo, plan.pr.number)
+                current_plan, current_reason = plan_release_merge(
                     repo,
-                    reason=(
-                        "release_pr_head_changed"
-                        if current.head_oid != plan.pr.head_oid
-                        else current_reason
-                    ),
-                    release_reason=(
-                        "release_pr_head_changed"
-                        if current.head_oid != plan.pr.head_oid
-                        else current_reason
-                    ),
+                    RepoState.GREEN,
+                    current_head.branch,
+                    [current],
+                    generator_busy=github.generator_busy(repo, current_head.branch),
                 )
+            if current_plan is None or current.head_oid != plan.pr.head_oid:
+                reason = (
+                    "release_pr_head_changed"
+                    if current.head_oid != plan.pr.head_oid
+                    else current_reason
+                )
+                counters["merge_skipped"] += 1
+                _mark(ledger_repos, repo, reason=reason, release_reason=reason)
+                release_decisions[repo] = reason
                 continue
             merge_result = github.merge(current_plan)
         except CiWatchError as error:
             counters["merge_skipped"] += 1
-            _mark(
-                ledger_repos,
-                repo,
-                reason=str(error),
-                release_reason=str(error),
-            )
+            reason = _bounded(error)
+            _mark(ledger_repos, repo, reason=reason, release_reason=reason)
+            release_decisions[repo] = reason
             continue
         if merge_result.returncode != 0:
             counters["merge_skipped"] += 1
+            reason = "merge_failed"
             _mark(
                 ledger_repos,
                 repo,
-                reason="merge_failed",
-                release_reason="merge_failed",
+                reason=reason,
+                release_reason=reason,
+                merge_error=_bounded(merge_result.stderr or merge_result.stdout),
             )
+            release_decisions[repo] = reason
             continue
         counters["merged"] += 1
-        merged_pr = current
-        merged_key = f"{repo}#{merged_pr.number}"
-        merged_keys.add(merged_key)
-        merged_notifications.append((repo, merged_pr))
-        release_merges.append(
-            {
-                "repo": repo,
-                "number": merged_pr.number,
-                "url": merged_pr.url,
-                "head_oid": merged_pr.head_oid,
-                "version": _extract_release_version(merged_pr.title),
-                "generator": config.release_repositories[repo],
-                "merged_at": now.isoformat(),
-            }
-        )
-        release_merges[:] = release_merges[-MAX_LEDGER_MERGES:]
+        _append_release_record(state, repo, current, now)
+        try:
+            _write_state(invocation, state)
+        except OSError as error:
+            operational_errors.append(f"state write failed after merge: {_bounded(error)}")
         _mark(
             ledger_repos,
             repo,
             reason="merged",
             release_reason="merged",
-            merged_pr=merged_pr.number,
-            head_oid=merged_pr.head_oid,
+            merged_pr=current.number,
+            head_oid=current.head_oid,
         )
+        release_decisions[repo] = "merged"
 
-    pending_notifications: list[tuple[str, int, str]] = []
-    configured_release_repos = set(config.release_repositories)
-    for key in list(announced_pending):
-        repo, separator, raw_number = key.rpartition("#")
-        stored_release_observation = release_observations.get(repo)
-        if (
-            not separator
-            or repo not in configured_release_repos
-            or not raw_number.isdigit()
-            or key in merged_keys
-            or (
-                stored_release_observation is not None
-                and stored_release_observation.numbers is not None
-                and int(raw_number) not in stored_release_observation.numbers
-            )
-        ):
-            announced_pending.pop(key, None)
-    for repo, release_observation in release_observations.items():
-        if release_observation.numbers is None:
-            continue
-        reason = release_decisions[repo]
-        blocked = reason not in _NON_BLOCKING_RELEASE_REASONS
-        for number in release_observation.numbers:
-            key = f"{repo}#{number}"
-            if key in merged_keys:
-                announced_pending.pop(key, None)
-                continue
-            pending_row = announced_pending.get(key, {})
-            previous_ticks = pending_row.get("consecutive_ticks", 0)
-            notified = pending_row.get("notified") is True
-            consecutive_ticks = (
-                int(previous_ticks) + 1 if blocked and isinstance(previous_ticks, int) else 0
-            )
-            announced_pending[key] = {
-                "consecutive_ticks": consecutive_ticks,
-                "notified": notified,
-            }
-            if blocked and consecutive_ticks >= 2 and not notified:
-                pending_notifications.append((repo, number, reason))
-
-    try:
-        _write_release_ledger(invocation, release_ledger)
-    except OSError as error:
-        invocation.logger.warning(f"{CHOP_NAME}: release ledger write skipped: {_bounded(error)}")
-
-    try:
-        release_report = _build_release_report(
-            config,
-            release_ledger,
-            release_observations,
-            release_decisions,
-            now,
-            merged_keys,
-        )
-    except (TypeError, ValueError) as error:
-        invocation.logger.warning(f"{CHOP_NAME}: release report build skipped: {_bounded(error)}")
-    else:
-        _publish_release_report(invocation, release_report)
-
-    merged_today = sum(
-        _parse_timestamp(str(row["merged_at"])).astimezone(now.tzinfo).date() == now.date()
-        for row in release_merges
-    )
-    pending_count = sum(
-        bool(observation.numbers)
-        and not all(f"{repo}#{number}" in merged_keys for number in observation.numbers or ())
-        for repo, observation in release_observations.items()
-    )
-    report_path = str(Path(invocation.context.state_dir).resolve() / RELEASE_REPORT_FILE_NAME)
-    release_action_data = {
-        "report_path": report_path,
-        "report_title": "Releases",
-    }
-    for repo, pr in merged_notifications:
-        if not agents.notify(
-            [
-                f"Merged release PR #{pr.number} for {repo}",
-                f"{merged_today} merged today · {pending_count} pending",
-            ],
-            icon="🚢",
-            tags=["ci", "release"],
-            action="ViewReport",
-            action_data=release_action_data,
-        ):
-            ledger_repos[repo]["notification"] = "failed"
-    pending_state_changed = False
-    for repo, number, reason in pending_notifications:
-        notification_ok = agents.notify(
-            [
-                (
-                    f"Release PR #{number} for {repo} needs attention: "
-                    f"{_humanize_release_reason(reason)}"
-                )
-            ],
-            icon="🚢",
-            tags=["ci", "release"],
-            action="ViewReport",
-            action_data=release_action_data,
-        )
-        if notification_ok:
-            announced_pending[f"{repo}#{number}"]["notified"] = True
-            pending_state_changed = True
-        else:
-            ledger_repos[repo]["release_notification"] = "failed"
-    if pending_state_changed:
+    if mode == "live":
+        _update_failure_state(state, failures, states, now)
         try:
-            _write_release_ledger(invocation, release_ledger)
+            _write_state(invocation, state)
         except OSError as error:
-            invocation.logger.warning(
-                f"{CHOP_NAME}: pending notification ledger write skipped: {_bounded(error)}"
-            )
+            operational_errors.append(f"state write failed: {_bounded(error)}")
 
-    actionable = bool(counters["fix_gated"] or counters["merged"])
+    report = _build_ci_watch_report(
+        config,
+        counters,
+        states,
+        heads,
+        failures,
+        release_observations,
+        release_decisions,
+        state,
+        mode,
+        now,
+    )
+    report_path: Path | None = None
+    if mode == "live":
+        try:
+            report_path = _publish_report(invocation, report)
+            counters["reports_published"] += 1
+        except (OSError, TypeError, ValueError) as error:
+            counters["reports_failed"] += 1
+            operational_errors.append(f"report publish failed: {_bounded(error)}")
+
+    state_write_failed = any(error.startswith("state write failed") for error in operational_errors)
+    if mode == "live" and not state_write_failed:
+        operational_errors.extend(
+            _send_required_notifications(
+                invocation=invocation,
+                notifier=notifier,
+                state=state,
+                failures=failures,
+                heads=heads,
+                report_path=report_path,
+                now=now,
+                counters=counters,
+            )
+        )
+
+    status: str = "ok" if counters["merged"] or counters["notifications_sent"] else "no_op"
+    result_reason: str | None = None if status == "ok" else "no_actions"
+    if operational_errors or counters["notifications_failed"] or counters["reports_failed"]:
+        status = "check_error"
+        result_reason = (
+            "notification_failed"
+            if counters["notifications_failed"]
+            else "report_publish_failed"
+            if counters["reports_failed"]
+            else "state_write_failed"
+        )
     result = result_with_summary(
         invocation,
         CHOP_NAME,
         counters,
-        status="ok" if actionable else "no_op",
-        reason=None if actionable else "no_actions",
-        report=_build_ci_watch_report(
-            config,
-            counters,
-            states,
-            heads,
-            failures,
-            ledger_repos,
-            release_plans,
-            mode,
-        ),
+        status=cast(Any, status),
+        reason=result_reason,
+        report=report,
     )
     ledger = {
         "mode": mode,
         "repositories": ledger_repos,
         "release_plans": [
-            {
-                "repo": plan.repo,
-                "number": plan.pr.number,
-                "head_oid": plan.pr.head_oid,
-            }
+            {"repo": plan.repo, "number": plan.pr.number, "head_oid": plan.pr.head_oid}
             for plan in release_plans
         ],
+        "notification_errors": operational_errors,
     }
     result.add_evidence(_write_ledger(invocation, ledger))
     return result
@@ -2337,18 +2049,13 @@ def main() -> None:
     run_chop(
         CHOP_NAME,
         """\
-Sweep SASE CI, gate non-overlapping repairs behind LaunchApproval, and guard
-release merges.
+Sweep SASE CI, send durable per-incident notifications, and guard release-please
+merges.
 
-Terminal failing-job evidence stays actionable while unrelated work is in flight.
-A mature red failure files one durable LaunchApproval gate; approval is never
-automatic. A new gate is suppressed while a live agent exists in the `ci_fix`
-hood, while an earlier gate is still unanswered, or once the same failing-job
-fingerprint has already been gated for the current red episode. Each failing-job
-set gets one gate per red episode; an observed green resolution starts a new
-episode. Repair agents use the `ci_fix.<slug>.@` template so SASE assigns a
-concrete launch token, and the gate prompt carries `%w(runners=0)` since Axe no
-longer applies lane-level `wait_runners` to a launch it did not itself propose.
+The chop never creates gates, launches agents, or emits repair proposals. It may
+only query actstat and GitHub, squash-merge an explicitly eligible release-please
+PR in live mode, publish the combined CI WATCH report, and call `sase notify
+create` for required release or failure notifications.
 """.strip(),
         build_ci_watch_result,
     )

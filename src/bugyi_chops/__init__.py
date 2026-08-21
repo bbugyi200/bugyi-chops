@@ -1,5 +1,5 @@
-"""Personal proposal-emitting SASE axe chops."""
+"""Personal SASE axe chops for notifications, releases, and maintenance proposals."""
 
 __all__ = ["__version__"]
 
-__version__ = "0.1.0"
+__version__ = "0.6.0"

@@ -1,30 +1,26 @@
 # bugyi-chops
 
 `bugyi-chops` is Bryan Bugyi's community [SASE](https://sase.sh/) plugin for
-scheduled Axe jobs that need to propose coding-agent work. It supplies two console
-scripts:
+scheduled Axe jobs that watch repository health, submit guarded release PRs, and
+propose maintenance work. It supplies two console scripts:
 
-| Script | What it proposes |
+| Script | Responsibility |
 | --- | --- |
-| `bugyi_chop_ci_watch` | LaunchApproval-gated CI repairs and explicitly enabled, guarded release merges |
+| `bugyi_chop_ci_watch` | Notify on CI failures and squash-merge explicitly enabled, guarded release-please PRs |
 | `bugyi_chop_toobig_split` | One `%auto #split_file:<path>` agent per oversized Python file, chained in scan order |
 
 The scripts never launch agents themselves. `bugyi_chop_toobig_split` scans and
-assembles a prompt, then uses the public `sase.chops` SDK to atomically write a
+assembles prompts, then uses the public `sase.chops` SDK to atomically write a
 validated result document; Axe owns guard and trigger evaluation, deduplication,
-workspace allocation, proposal launches, and the final action lifecycle for that
-proposal. `bugyi_chop_ci_watch`'s CI-fix path instead files a durable LaunchApproval
-gate directly (see [`ci_watch` CI-fix gates](#ci_watch-ci-fix-gates) below); a human
-always approves or rejects it before any repair agent launches.
+workspace allocation, proposal launches, and the final action lifecycle for those
+proposals.
 
-`bugyi_chop_ci_watch` additionally owns a tightly guarded direct side effect: when
-`vars.merge_enabled` is true and `SASE_CHOP_DRY_RUN=0` is explicitly present, it may
-squash-merge one fully green release-please or release-plz PR. Missing or true dry-run
-context always suppresses merging. Its CI-fix gates are filed only when a
-`sase agent list -j` probe reports no live agent in the `ci_fix` hood, no earlier gate
-is still pending, and the current failing-job fingerprint has not already been gated
-for this red episode. Approved repair agents use the `ci_fix.<slug>.@` template so SASE
-assigns a unique launch token.
+`bugyi_chop_ci_watch` is deliberately narrower. It never creates gates, launch
+requests, repair prompts, or Axe proposals. Its only mutation outside its own state and
+report files is a guarded `gh pr merge --squash --match-head-commit` for an eligible
+release-please PR when `vars.merge_enabled` is true and `SASE_CHOP_DRY_RUN=0` is
+explicitly present. Missing or true dry-run context suppresses merging and
+notifications.
 
 ## Installation
 
@@ -71,58 +67,53 @@ dependencies, filters duplicate proposals, and tracks linked agents through
 `action_succeeded` or `action_failed`. The prompts here may use inline xprompts such
 as `#pr` and `#split_file`; they never use forbidden standalone `#!workflow`
 references. This proposal contract governs `bugyi_chop_toobig_split`.
-`bugyi_chop_ci_watch`'s CI-fix path never populates `proposed_launches`; it creates a
-LaunchApproval gate directly through `sase launch request` instead, so its result
-document always carries an empty proposal list.
+`bugyi_chop_ci_watch` always returns an empty `proposed_launches` list.
 
-## `ci_watch` CI-fix gates
+## `ci_watch`
 
-Once a red repository's failing-job fingerprint has held for `red_debounce_ticks`
-ticks, `bugyi_chop_ci_watch` files a durable LaunchApproval gate instead of proposing a
-launch to Axe:
+`bugyi_chop_ci_watch` sweeps the configured repository allowlist through `actstat`,
+reconciles each settled commit with the current default branch through bounded GitHub
+queries, and publishes a combined `CI WATCH` report. Red observations keep typed job
+evidence: workflow name, job name, conclusion, direct job/run URL, failing steps,
+failing SHA, and current-head SHA when a stale settled failure is still actionable
+while newer HEAD checks are unsettled.
 
-```bash
-sase launch request -f <payload.json> -o json -s ci_watch
+Failure notifications are incident-based. The state file `ci_watch_state.json` tracks
+the active failing-job fingerprint per repository, independent of SHA. The same
+failure is announced once and kept active while it persists; changed job/step evidence
+replaces the incident; a green or non-red observation clears it so a later recurrence
+is announced again. Failed notification deliveries remain marked unsent and are retried
+on the next live tick.
+
+Release handling is release-please only. Configure `vars.release_repositories` as a
+list of repositories from `vars.repos`; generator mappings are rejected and other
+release branch families are ignored. A release PR is mergeable only when all guards
+pass: exactly one release-please candidate for the repository, configured default base, non-draft,
+mergeable and clean, non-empty fully green check rollup, green current default branch,
+idle release-please/publish workflow, deterministic dependency order,
+`max_merges_per_tick`, explicit live mode, a final PR/default-branch reread, and
+`--match-head-commit` race protection.
+
+Successful merge submissions are written durably with `notification_sent: false` before
+any SASE notification is attempted. The release notification is marked delivered only
+after `sase notify create` succeeds, so a later tick retries an unsent release notice.
+If report publication fails, inline notifications still include the full evidence but
+omit the `ViewReport` action and the chop returns `check_error` so the failure is
+visible.
+
+Minimal configuration:
+
+```yaml
+vars:
+  actstat_bin: /home/bryan/.cargo/bin/actstat
+  gh_bin: gh
+  sase_bin: sase
+  repos: [sase-org/sase, sase-org/sase-core, sase-org/sase-telegram]
+  release_repositories: [sase-org/sase-telegram, sase-org/sase]
+  merge_order: [sase-telegram, sase]
+  max_merges_per_tick: 1
+  merge_enabled: true
 ```
-
-The gate kind is `launch` (`LaunchApproval`, `auto_policy: "forbidden"`), so approval is
-never automatic — a human must approve or reject the gate before any `ci_fix.<slug>.@`
-agent launches. Axe never scaffolds a LaunchApproval prompt the way it scaffolds a
-proposal, so the prompt itself is self-sufficient:
-
-```text
-#gh:<owner>/<repo> %i:ci_fix.<slug>.@ %w(runners=0)
-
-#pr(ci_fix_<slug>_<sha7>, status=ready)
-
-#actstat(repo=<owner>/<repo>)
-
-Repair the current default-branch CI failure in <owner>/<repo>.
-...
-```
-
-Each tick evaluates, in order, whether a new gate is suppressed — first match wins:
-
-1. `fix_enabled` is false → `fix_disabled`.
-2. The `sase agent list -j` probe fails → `agents_check_failed`.
-3. A live agent named `ci_fix` or `ci_fix.*` exists → `fix_in_flight`.
-4. Any gate recorded in the fix ledger is still `pending` → `gate_pending`. This is
-   global: while one CI-fix gate is unanswered, no new gate is filed for any repo.
-5. The candidate's dedupe key is already recorded in the ledger → `already_gated`.
-6. The per-tick cap `max_fix_proposals_per_tick` is reached → `fix_cap_reached`.
-7. The tick is a dry run (`SASE_CHOP_DRY_RUN=1`) → `dry_run`. A dry run reports the
-   gate it would have filed but never creates one and never records its dedupe key, so
-   the next live tick still gates that failure.
-8. Otherwise, the gate is created.
-
-The durable ledger (`ci_watch_fixes.json`, schema version 2) records each gate's
-request id under the dedupe key `ci_fix:{repo}:{failing_job_fingerprint}:e{episode}`,
-where `episode` increments only when a repository is observed going red and then green
-again. A key is recorded the instant its gate is created and is never re-gated: a
-rejected, cancelled, or timed-out gate does not come back, and only a genuinely new
-failure — a changed failing-job fingerprint or a new red episode — can produce another
-gate. The gate itself is the only user-facing signal for a CI-fix; no separate
-notification is sent.
 
 ## `toobig_split`
 
@@ -213,12 +204,13 @@ environment variables are also accepted: `SASE_TOOBIG_SPLIT_PROJECT`,
 
 ## Debugging
 
-Preview a configured script and the exact scaffolded proposals without launching
-agents:
+Preview configured chops without side effects:
 
 ```bash
+sase axe chop run 'ci_watch' -L ci_watch --dry-run --chop-verbose
 sase axe chop run 'toobig_split[sase]' -L maintenance --dry-run --chop-verbose
 # Short flags:
+sase axe chop run 'ci_watch' -L ci_watch -n -V
 sase axe chop run 'toobig_split[sase]' -L maintenance -n -V
 ```
 
@@ -227,9 +219,14 @@ Every actual invocation also emits a compact summary line with bounded integer
 counters and an explicit reason for no-op/error outcomes.
 
 For lower-level diagnosis, reuse a context JSON written by Axe and invoke a script
-directly. This writes proposals but never launches them:
+directly. `ci_watch` requires `SASE_CHOP_DRY_RUN=0` before it can notify or submit a
+merge; all other direct invocations render decisions only:
 
 ```bash
+SASE_CHOP_RESULT_FILE=/tmp/ci-watch-result.json \
+  bugyi_chop_ci_watch --context /path/to/context.json --verbose
+jq . /tmp/ci-watch-result.json
+
 SASE_CHOP_RESULT_FILE=/tmp/toobig-result.json \
   bugyi_chop_toobig_split --context /path/to/context.json --verbose
 jq . /tmp/toobig-result.json
