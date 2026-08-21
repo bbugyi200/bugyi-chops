@@ -271,6 +271,21 @@ def _normalize_scanned_path(raw_path: str, repo_root: Path) -> str:
     return normalized
 
 
+def _files_only_payload(stdout: str) -> list[str]:
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+
+def _healthy_files_only_result(returncode: int, payload_lines: Sequence[str]) -> bool:
+    """Return whether a files-only toobig run completed with a usable listing.
+
+    Exit 0 is always a completed scan. Exit 1 is a completed scan only when
+    stdout lists at least one path (hard-limit findings). Empty exit-1 and any
+    other nonzero code are scanner failures.
+    """
+
+    return returncode == 0 or (returncode == 1 and bool(payload_lines))
+
+
 def _scan_files(
     executable: Path,
     repo_root: Path,
@@ -284,16 +299,14 @@ def _scan_files(
         command = [str(executable), "--files-only", tree, *(str(limit) for limit in limits)]
         invocation.logger.debug(f"running in {repo_root}: {shlex.join(command)}")
         result = _run_command(command, cwd=repo_root)
-        if result.returncode != 0:
+        payload_lines = _files_only_payload(result.stdout)
+        if not _healthy_files_only_result(result.returncode, payload_lines):
             detail = _compact_detail(result.stderr or result.stdout)
             raise RuntimeError(
                 f"scanner failed: tree={tree!r} exit_code={result.returncode} "
                 f"detail={detail or '-'}"
             )
-        for line in result.stdout.splitlines():
-            raw_path = line.strip()
-            if not raw_path:
-                continue
+        for raw_path in payload_lines:
             path = _normalize_scanned_path(raw_path, repo_root)
             if path not in seen:
                 seen.add(path)

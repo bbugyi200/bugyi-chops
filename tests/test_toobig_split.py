@@ -57,6 +57,7 @@ case "$2" in
     lib) printf '%b' "${BUGYI_TEST_TOOBIG_LIB:-}" ;;
     *) printf 'unexpected tree: %s\\n' "$2" >&2; exit 24 ;;
 esac
+exit "${BUGYI_TEST_TOOBIG_EXIT:-0}"
 """,
         encoding="utf-8",
     )
@@ -545,6 +546,94 @@ def test_no_oversized_files_is_a_typed_noop(
         "text": "Every scanned file is within limits",
         "tone": "ok",
     }
+    validate_chop_result(result)
+
+
+def test_hard_limit_exit_1_emits_actionable_violation_proposal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+) -> None:
+    repo = _prepare_repo(tmp_path)
+    oversized = repo / "src/pkg/large.py"
+    oversized.write_text("x\n" * 1001, encoding="utf-8")
+    scanner = _fake_toobig(tmp_path)
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", "src/pkg/large.py\\n")
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_EXIT", "1")
+
+    result = run_chop_main(
+        main,
+        tmp_path,
+        monkeypatch,
+        target=_target(repo),
+        variables={"toobig": str(scanner), "trees": ["src"]},
+    )
+
+    assert result["status"] == "ok"
+    assert result["counters"] == {"files": 1, "proposals": 1, "trees": 1}
+    proposal = result["proposed_launches"][0]
+    assert proposal["prompt"] == "%auto %wait(priority=20) #split_file:src/pkg/large.py"
+    assert proposal["agent_name"] == "split_file.src.pkg.large.@"
+    assert proposal["clan"] == "toobig-@"
+    summary_plain = Text.from_markup(proposal["clan_summary"]).plain
+    assert "◆ TOOBIG SPLIT · 1 FILE" in summary_plain
+    assert "▲ 1,001  src/pkg/large.py" in summary_plain
+    assert result["report"]["blocks"][0] == {
+        "kind": "headline",
+        "text": "1 files over limits",
+        "tone": "error",
+    }
+    report_rows = next(block for block in result["report"]["blocks"] if block["kind"] == "rows")[
+        "rows"
+    ]
+    assert report_rows == [
+        {
+            "cells": ["1001", "src/pkg/large.py"],
+            "tone": "error",
+            "glyph": "▲",
+        }
+    ]
+    validate_chop_result(result)
+
+
+@pytest.mark.parametrize(
+    ("output", "exit_code"),
+    [
+        ("", "1"),
+        ("\\n", "1"),
+        ("src/pkg/large.py\\n", "2"),
+    ],
+)
+def test_empty_exit_1_and_other_scanner_failures_are_check_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+    output: str,
+    exit_code: str,
+) -> None:
+    repo = _prepare_repo(tmp_path)
+    scanner = _fake_toobig(tmp_path)
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", output)
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_EXIT", exit_code)
+
+    result = run_chop_main(
+        main,
+        tmp_path,
+        monkeypatch,
+        target=_target(repo),
+        variables={"toobig": str(scanner), "trees": ["src"]},
+    )
+
+    assert result["status"] == "check_error"
+    assert result["reason"] == "check_failed"
+    assert result["proposed_launches"] == []
+    assert result["counters"] == {"proposals": 0}
+    headline = result["report"]["blocks"][0]
+    assert headline["tone"] == "error"
+    assert f"exit_code={exit_code}" in headline["text"]
+    assert "scanner failed" in headline["text"]
     validate_chop_result(result)
 
 

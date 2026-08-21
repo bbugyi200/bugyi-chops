@@ -127,8 +127,18 @@ notification is sent.
 ## `toobig_split`
 
 `bugyi_chop_toobig_split` runs `toobig --files-only` for each configured tree,
-normalizes and de-duplicates its paths, and emits one proposal per file. Each proposal
-has:
+normalizes and de-duplicates its paths, and emits one proposal per file.
+
+The scanner contract is fail-closed around two healthy outcomes. Exit `0` is a
+completed scan whose stdout listing, if any, contains only informational or
+warning-level paths. Exit `1` with one or more listed paths is also a completed
+scan: `toobig` uses that exit code for a hard-limit hit and still writes the
+matching paths to stdout, which this chop consumes as actionable findings.
+Malformed invocations, missing trees, and other filesystem errors reuse exit
+`1` but produce no path payload; those empty exit-`1` results, and every other
+nonzero status, remain a typed `check_error`.
+
+Each proposal has:
 
 - the shared `toobig-@` clan template, with a stable marker-free `split_file.*`
   member ID;
