@@ -33,6 +33,8 @@ def run_chop(
                 "state_dir": str(tmp_path / "state"),
                 "all_changespecs_file": str(tmp_path / "all.json"),
                 "filtered_changespecs_file": str(tmp_path / "filtered.json"),
+                "all_patches_file": str(tmp_path / "all.json"),
+                "filtered_patches_file": str(tmp_path / "filtered.json"),
                 "verbose_lumberjack_diagnostics": False,
                 "result_file": str(result_path),
                 "target": target or {},

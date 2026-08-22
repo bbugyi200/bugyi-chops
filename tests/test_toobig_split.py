@@ -27,12 +27,15 @@ from bugyi_chops.toobig_split import (
     CLAN_SUMMARY_VIOLATION_STYLE,
     CLAN_SUMMARY_WARNING_STYLE,
     CLAN_SUMMARY_WIDTH,
+    PROPOSAL_MODEL,
     FileEntry,
     _elide_path,
     _line_count,
     _render_clan_summary,
     main,
 )
+
+MODEL_DIRECTIVE = f"%model:{PROPOSAL_MODEL}"
 
 MISSION_LINES = [
     "MISSION",
@@ -102,6 +105,20 @@ def _target(repo: Path) -> dict[str, str]:
         "workspace": "gh:example/demo",
         "workspace_dir": str(repo),
     }
+
+
+def _assert_raw_proposals_use_medium_model(proposals: list[dict[str, Any]]) -> None:
+    assert proposals
+    assert all(proposal["model"] == PROPOSAL_MODEL for proposal in proposals)
+
+
+def _assert_planned_prompts_use_medium_model(prompts: list[str]) -> None:
+    assert prompts
+    assert all(prompt.count(MODEL_DIRECTIVE) == 1 for prompt in prompts)
+    assert all(prompt.count("%model:") == 1 for prompt in prompts)
+    parsed = [extract_prompt_directives(prompt)[1] for prompt in prompts]
+    assert all(directives.model == "medium" for directives in parsed)
+    assert all(getattr(directives, "model_alias", "medium") == "medium" for directives in parsed)
 
 
 def _prepare_repo(tmp_path: Path) -> Path:
@@ -297,6 +314,7 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert result["status"] == "ok"
     assert result["counters"] == {"files": 3, "proposals": 3, "trees": 2}
     proposals = result["proposed_launches"]
+    _assert_raw_proposals_use_medium_model(proposals)
     assert [proposal["prompt"] for proposal in proposals] == [
         "%auto %wait(priority=20) #split_file:src/pkg/large.py",
         "%auto %wait(priority=20) #split_file:src/pkg/shared.py",
@@ -362,6 +380,7 @@ def test_scan_agent_name_keeps_full_safe_dotted_module_path(
     )
 
     assert result["status"] == "ok"
+    _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     assert [proposal["agent_name"] for proposal in result["proposed_launches"]] == [
         "split_file.src.pkg.section_abcdefghijklmnopqrstuvwxyz0123456789.trailing_module.@"
     ]
@@ -385,8 +404,10 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
         variables={"toobig": str(scanner)},
     )
     authored_summary = result["proposed_launches"][0]["clan_summary"]
+    _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     prepared = prepare_chop_proposals("toobig_split", result)
     assert {proposal.clan_summary for proposal in prepared} == {authored_summary}
+    assert all(proposal.model == PROPOSAL_MODEL for proposal in prepared)
 
     import sase.agent.names as agent_names
 
@@ -408,6 +429,7 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
     assert sum(plan.prompt.count("summary=[[") for plan in plans) == 1
     assert f"%clan(toobig-0, tribe=chop, summary=[[{authored_summary}]])" in plans[0].prompt
     assert all("summary=[[" not in plan.prompt for plan in plans[1:])
+    _assert_planned_prompts_use_medium_model([plan.prompt for plan in plans])
 
     parsed = [extract_prompt_directives(plan.prompt)[1] for plan in plans]
     assert parsed[0].clan_declared
@@ -426,6 +448,7 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
     assert [plan.declares_clan for plan in tail_plans] == [True, False]
     assert [plan.clan_summary for plan in tail_plans] == [authored_summary, None]
     assert extract_prompt_directives(tail_plans[0].prompt)[1].clan_summary == authored_summary
+    _assert_planned_prompts_use_medium_model([plan.prompt for plan in tail_plans])
 
 
 def test_custom_tree_limits_and_legacy_env_target_resolution(
@@ -449,6 +472,7 @@ def test_custom_tree_limits_and_legacy_env_target_resolution(
     result = run_chop_main(main, tmp_path, monkeypatch)
 
     proposal = result["proposed_launches"][0]
+    _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     assert proposal["workspace"] == "git:demo"
     assert proposal["prompt"] == "%auto %wait(priority=20) #split_file:lib/large.py"
     assert calls.read_text(encoding="utf-8").strip() == "--files-only lib 90 80 70"
@@ -475,6 +499,7 @@ def test_project_resolution_supplies_repo_and_workspace(
     )
 
     assert result["status"] == "ok"
+    _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     assert result["proposed_launches"][0]["workspace"] == "gh:demo"
 
 
@@ -573,6 +598,7 @@ def test_hard_limit_exit_1_emits_actionable_violation_proposal(
     assert result["status"] == "ok"
     assert result["counters"] == {"files": 1, "proposals": 1, "trees": 1}
     proposal = result["proposed_launches"][0]
+    _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     assert proposal["prompt"] == "%auto %wait(priority=20) #split_file:src/pkg/large.py"
     assert proposal["agent_name"] == "split_file.src.pkg.large.@"
     assert proposal["clan"] == "toobig-@"
@@ -722,6 +748,7 @@ def test_absolute_scanner_paths_are_normalized_and_missing_files_still_dedupe(
     )
 
     proposals = result["proposed_launches"]
+    _assert_raw_proposals_use_medium_model(proposals)
     assert [proposal["prompt"] for proposal in proposals] == [
         "%auto %wait(priority=20) #split_file:src/pkg/large.py",
         "%auto %wait(priority=20) #split_file:src/pkg/missing.py",
@@ -787,4 +814,5 @@ def test_toobig_never_calls_sase_or_creates_lock_state(
     )
 
     assert result["status"] == "ok"
+    _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     assert list((tmp_path / "state").glob("*.lock")) == []

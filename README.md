@@ -7,7 +7,7 @@ propose maintenance work. It supplies two console scripts:
 | Script | Responsibility |
 | --- | --- |
 | `bugyi_chop_ci_watch` | Notify on CI failures and squash-merge explicitly enabled, guarded release-please PRs |
-| `bugyi_chop_toobig_split` | One `%auto #split_file:<path>` agent per oversized Python file, chained in scan order |
+| `bugyi_chop_toobig_split` | One sequential `%auto #split_file:<path>` agent per oversized Python file, routed through `@medium` |
 
 The scripts never launch agents themselves. `bugyi_chop_toobig_split` scans and
 assembles prompts, then uses the public `sase.chops` SDK to atomically write a
@@ -55,7 +55,8 @@ Axe invokes a configured script as `<script> --context <context.json>` and suppl
     {
       "id": "split_file-src-large_py",
       "prompt": "%auto #split_file:src/large.py",
-      "workspace": "gh:sase-org/sase"
+      "workspace": "gh:sase-org/sase",
+      "model": "@medium"
     }
   ]
 }
@@ -135,9 +136,16 @@ Each proposal has:
   member ID;
 - the same Rich `clan_summary` metadata, describing the mission, file and scan-root
   counts, configured limits, and sequential queue;
+- structured `model: "@medium"`, which Axe renders as one `%model:@medium`
+  directive alongside `%auto #split_file:<path>`;
 - `%auto #split_file:<path>` as its prompt;
 - a content-sensitive dedupe key, so an unchanged file is not relaunched;
 - `wait_on` pointing to the prior file, preserving sequential workspace allocation.
+
+The structured `@medium` field is the only model source. It selects SASE's
+configurable, load-balanced alias pool rather than pinning a concrete
+provider/model in the prompt body, so operators retune `@medium` centrally
+without a per-chop model variable.
 
 The repeated summary metadata is deliberate: after deduplication, any surviving
 proposal can safely become the clan declarer. Axe allocates the concrete clan template
@@ -183,7 +191,8 @@ axe:
             `tests` trees with the `1000`, `850`, and `700` line limits.
 
             Each actionable scan emits content-deduped `%auto #split_file:<path>` proposals in a sequential `toobig-`
-            clan, so one oversized file is handled before the next claim starts.
+            clan, so one oversized file is handled before the next claim starts. The chop sets the structured proposal
+            model to `@medium`; Axe emits `%model:@medium` and SASE consumes the alias pool at each real invocation.
           run_every: 60m
           inhibit_if:
             agent_clan: {name_prefix: toobig-}

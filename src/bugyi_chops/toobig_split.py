@@ -35,6 +35,7 @@ from bugyi_chops._report import (
 
 CHOP_NAME = "toobig_split"
 CLAN_TEMPLATE = "toobig-@"
+PROPOSAL_MODEL = "@medium"
 DEFAULT_TREES = ("src", "tests")
 DEFAULT_LIMITS = (1000, 850, 700)
 DETAIL_LIMIT_CHARS = 500
@@ -539,6 +540,7 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
             agent_name=_agent_name(path),
             clan=CLAN_TEMPLATE,
             clan_summary=clan_summary,
+            model=PROPOSAL_MODEL,
             dedupe_key=_dedupe_key(target.repo_root, target.workspace, path),
             wait_on=prior_id,
         )
