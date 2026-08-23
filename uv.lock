@@ -80,8 +80,17 @@ wheels = [
 ]
 
 [[package]]
+name = "bracex"
+version = "3.0.1"
+source = { registry = "https://pypi.org/simple/" }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/01/5f394b8bcd6e5b92f73130990960423bbb19711f906bd9fe9ea5557c667c/bracex-3.0.1.tar.gz", hash = "sha256:4e38e32392e4a4780fe15d644bfc7c8514057cfc3861e060b11814ce829c25e4", size = 44019, upload-time = "2026-07-20T13:43:00.335Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b8/8f/6f7273a7adb8d73fc8d21ede4376a3e475e52f98435c6007f69100dec8ca/bracex-3.0.1-py3-none-any.whl", hash = "sha256:6523ad83aeb5098a4ee597cff0f964442ff74e460bd3fafaffab6a013ff2288c", size = 11940, upload-time = "2026-07-20T13:42:59.268Z" },
+]
+
+[[package]]
 name = "bugyi-chops"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "sase" },
@@ -100,7 +109,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "sase", specifier = ">=0.13.2,<0.14.0" },
+    { name = "sase", specifier = ">=0.16.0,<0.17.0" },
     { name = "toobig", specifier = ">=0.1.0,<0.2.0" },
 ]
 
@@ -1377,7 +1386,7 @@ wheels = [
 
 [[package]]
 name = "sase"
-version = "0.13.3"
+version = "0.16.0"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "jinja2" },
@@ -1392,22 +1401,23 @@ dependencies = [
     { name = "sase-core-rs" },
     { name = "schedule" },
     { name = "textual", extra = ["syntax"] },
+    { name = "wcmatch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/61/b1/55d5f1240134a29e9aca664287a0fe500331a119c780e5e0bc695ca28f60/sase-0.13.3.tar.gz", hash = "sha256:851a15be9e539d00489c5d4db8db5c8e551d66d1d2fe341abd72d76d10223c44", size = 11876375, upload-time = "2026-07-29T15:59:40.277Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/77/a1/9c1e6b200dc2b9eb2f224cc375d6778a3511a8bfaf5a3f5d5dc5fc5d5e40/sase-0.16.0.tar.gz", hash = "sha256:ff5b008aeb3deba8f75775477b6dd525bbe9c3371e373605a1f3bf41b27d7dcb", size = 11185878, upload-time = "2026-08-07T05:54:31.2Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a7/89/0c353fcb1d4323740ffb67048ac29e98f6990ac4617074718a572bdf6bf7/sase-0.13.3-py3-none-any.whl", hash = "sha256:1982aa52bc90eaf1bce6045d772decff9bf28734e2dab2622b415120ebc71a1b", size = 13315939, upload-time = "2026-07-29T15:59:37.372Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/d7/a1716a0f34f509f2acc155806493a8d41f7b9517cef0c5756dfa0b50c320/sase-0.16.0-py3-none-any.whl", hash = "sha256:4464d268633241edeca0a9bcded217692604c57b6992602396e9fbca58981111", size = 12802879, upload-time = "2026-08-07T05:54:28.525Z" },
 ]
 
 [[package]]
 name = "sase-core-rs"
-version = "0.12.19"
+version = "0.19.3"
 source = { registry = "https://pypi.org/simple/" }
-sdist = { url = "https://files.pythonhosted.org/packages/d1/d3/b09ae603d4754fde2acb98b9b6ba13e8d7093e9fa2a3da08da4f05a1d27c/sase_core_rs-0.12.19.tar.gz", hash = "sha256:012449d86d0bbca2f2a8b4a4698fc5057a98d998c75d5b9e61289cf13addb6cb", size = 701026, upload-time = "2026-07-30T12:03:07.644Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/85/cd/7438de6735a3399aa180624ba88b880505739ce7801dc6df8db2552c6801/sase_core_rs-0.19.3.tar.gz", hash = "sha256:fa2f266eca291b7c45c585730a4128932a7958e1881a4eb4a510eb88dd282c5a", size = 812040, upload-time = "2026-08-07T15:41:30.172Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/61/92/2c0fad1089842745e29a4a2f272337f437728f11fa3c4ee34bbd43326dab/sase_core_rs-0.12.19-cp312-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:8829bb8378c3db1788c5704bfdcbc3c768faf1910af0f2b14ea95d7f9c67f6c8", size = 9193884, upload-time = "2026-07-30T12:03:00.35Z" },
-    { url = "https://files.pythonhosted.org/packages/65/c3/214319033b6ae901910603843cd7c02a83d0dd8251a7f637989dc1d579c0/sase_core_rs-0.12.19-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:51a850b3d79da388fc6bea66176e5c75bb6a07adf716066d27d601cbe7f278f9", size = 4440135, upload-time = "2026-07-30T12:03:02.389Z" },
-    { url = "https://files.pythonhosted.org/packages/7a/20/20c5b81f9af011972a4e1ece6d8f5c2174ca8a0ea3447efa22db4f56aad9/sase_core_rs-0.12.19-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:85d2387bbeba3c6a42f1202b0338a5b53592603ece6e80176c2329a3173ddae6", size = 5006232, upload-time = "2026-07-30T12:03:04.13Z" },
-    { url = "https://files.pythonhosted.org/packages/e6/30/e46d4d05650542b41d8ba9bcbdbd26f8ded3cc5d1328ff22268152175209/sase_core_rs-0.12.19-cp312-abi3-win_amd64.whl", hash = "sha256:d5585e476b004f477217ee9fdda1e1702e14c871dd9ffc642280ea7ffb93a7db", size = 5162866, upload-time = "2026-07-30T12:03:05.745Z" },
+    { url = "https://files.pythonhosted.org/packages/73/3f/273f9e121a272767e57dbe38b326316aef65d40ae47c1fec53d85cbf5d6d/sase_core_rs-0.19.3-cp312-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:8d66d78981e1eaa1eb57a682dbe01455e72f95c8519a6d5d243115561dd98776", size = 10123583, upload-time = "2026-08-07T15:41:23.05Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/f6/ba7b9f6349228840e35a46dc1f251d78ac90800a66d637068dca5969049e/sase_core_rs-0.19.3-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:b4cb06aae0d166c16017e441f5f1e269286f2fea77996fb3e9a5a7a02e22f6b6", size = 4885229, upload-time = "2026-08-07T15:41:25.058Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/76/dee388da1d1a630a602fdf1d2a8ad339a4015fb473e5781208e3e9d32b30/sase_core_rs-0.19.3-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:d05a01fc51c1d024374cce32e513a6c7216736d08fa53753684cea1a5451b60d", size = 5512335, upload-time = "2026-08-07T15:41:26.778Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/44/2ad8f9381abec5f632630459ddf9a560e02bda792458c5a856e38cd3638c/sase_core_rs-0.19.3-cp312-abi3-win_amd64.whl", hash = "sha256:9ecd205fe5694c7db50de95b55930ac036b8bdc3211bba6efd0936e0b3d70dfb", size = 5709577, upload-time = "2026-08-07T15:41:28.493Z" },
 ]
 
 [[package]]
@@ -1790,4 +1800,16 @@ source = { registry = "https://pypi.org/simple/" }
 sdist = { url = "https://files.pythonhosted.org/packages/53/0c/06f8b233b8fd13b9e5ee11424ef85419ba0d8ba0b3138bf360be2ff56953/urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c", size = 433602, upload-time = "2026-05-07T16:13:18.596Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7f/3e/5db95bcf282c52709639744ca2a8b149baccf648e39c8cc87553df9eae0c/urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897", size = 131087, upload-time = "2026-05-07T16:13:17.151Z" },
+]
+
+[[package]]
+name = "wcmatch"
+version = "11.0.1"
+source = { registry = "https://pypi.org/simple/" }
+dependencies = [
+    { name = "bracex" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/57/43/30e407989e313677dbb9d5f045f966549a7254834571e342eaa4b55cc67b/wcmatch-11.0.1.tar.gz", hash = "sha256:1ea2b4fa678b8ca268253798d5963935df39132d47c3e241c0a0732224005e7d", size = 144662, upload-time = "2026-08-14T15:20:40.477Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/77/7a02b0f05b3ffcdbef9719ce3ee0b508d6a29b58e95299f1580055671db3/wcmatch-11.0.1-py3-none-any.whl", hash = "sha256:fd149ecddb9f0a88ea780017d6dde17c994e494e7f7303d4e3c9d6251f978f4b", size = 43449, upload-time = "2026-08-14T15:20:39.379Z" },
 ]

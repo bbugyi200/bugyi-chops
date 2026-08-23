@@ -325,21 +325,27 @@ def _agent_name(path: str) -> str:
     return f"split_file.{slug}.@"
 
 
-def _repo_revision(repo_root: Path) -> str | None:
-    try:
-        result = _run_command(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
-    except RuntimeError:
-        return None
-    if result.returncode != 0:
-        return None
-    revision = result.stdout.strip()
-    return revision or None
-
-
-def _dedupe_key(workspace: str, path: str, revision: str | None) -> str | None:
-    if revision is None:
-        return None
-    return f"toobig_split:{workspace}:{path}:{revision}"
+def _admission_prompt(path: str, floor: int) -> str:
+    quoted_path = shlex.quote(path)
+    return (
+        "%if::\n"
+        "```bash\n"
+        f"path={quoted_path}\n"
+        'if [ ! -f "$path" ]; then\n'
+        "    exit 1\n"
+        "fi\n"
+        'line_count=$(wc -l < "$path") || exit 2\n'
+        "line_count=${line_count//[[:space:]]/}\n"
+        'case "$line_count" in\n'
+        "    ''|*[!0-9]*) exit 2 ;;\n"
+        "esac\n"
+        f"if (( line_count >= {floor} )); then\n"
+        "    exit 0\n"
+        "fi\n"
+        "exit 1\n"
+        "```\n"
+        f"%auto %wait(priority={LAUNCH_PRIORITY}) #split_file:{path}"
+    )
 
 
 def _line_count(path: Path) -> int | None:
@@ -538,19 +544,18 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
         report=_build_report(rows, overflow, len(trees), limits),
     )
     clan_summary = _render_clan_summary(entries, len(trees), limits)
-    revision = _repo_revision(target.repo_root)
+    floor = min(limits)
     prior_id: str | None = None
     for path in files:
         proposal_id = f"split-{_path_digest(path)}"
         result.propose(
-            f"%auto %wait(priority={LAUNCH_PRIORITY}) #split_file:{path}",
+            _admission_prompt(path, floor),
             target.workspace,
             proposal_id=proposal_id,
             agent_name=_agent_name(path),
             clan=CLAN_TEMPLATE,
             clan_summary=clan_summary,
             model=PROPOSAL_MODEL,
-            dedupe_key=_dedupe_key(target.workspace, path, revision),
             wait_on=prior_id,
         )
         prior_id = proposal_id

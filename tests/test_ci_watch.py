@@ -309,8 +309,8 @@ def _invocation(
         query="",
         lumberjack_name="test",
         state_dir=str(tmp_path),
-        all_changespecs_file=str(tmp_path / "all.json"),
-        filtered_changespecs_file=str(tmp_path / "filtered.json"),
+        all_patches_file=str(tmp_path / "all.json"),
+        filtered_patches_file=str(tmp_path / "filtered.json"),
         result_file=str(tmp_path / result_file),
         vars=variables,
     )

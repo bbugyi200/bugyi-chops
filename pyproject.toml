@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27,<1.28"]
 build-backend = "hatchling.build"
 
 [project]
 name = "bugyi-chops"
-version = "0.6.0"
+version = "0.7.0"
 description = "Personal SASE axe chops for notifications, releases, and maintenance proposals"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,7 +28,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "sase>=0.13.2,<0.14.0",
+    "sase>=0.16.0,<0.17.0",
     "toobig>=0.1.0,<0.2.0",
 ]
 

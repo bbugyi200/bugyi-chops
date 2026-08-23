@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from rich.cells import cell_len
 from rich.style import Style
 from rich.text import Text
+from sase.axe.chop_proposal_launch import launch_chop_proposals
 from sase.axe.chop_proposals import plan_chop_proposals, prepare_chop_proposals
 from sase.core.axe_chop_facade import validate_chop_result
+from sase.feature_flags import override_flags
 from sase.xprompt.directives import extract_prompt_directives
 
 from bugyi_chops.toobig_split import (
@@ -30,10 +34,10 @@ from bugyi_chops.toobig_split import (
     CLAN_SUMMARY_WIDTH,
     PROPOSAL_MODEL,
     FileEntry,
+    _admission_prompt,
     _elide_path,
     _line_count,
     _render_clan_summary,
-    _repo_revision,
     main,
 )
 
@@ -44,6 +48,51 @@ MISSION_LINES = [
     "Decompose oversized Python modules into focused, reviewable units",
     "without changing behavior.",
 ]
+
+
+def _parse_condition_prompt(prompt: str, path: str, floor: int) -> tuple[str, str]:
+    assert prompt.count("%if::") == 1
+    assert prompt.count("```bash") == 1
+    assert prompt.endswith(f"%auto %wait(priority=20) #split_file:{path}")
+    with override_flags(typed_launch_units=True):
+        cleaned, directives = extract_prompt_directives(prompt)
+    assert directives.if_code is not None
+    assert directives.if_code.language == "bash"
+    body = directives.if_code.source
+    assert f"path={shlex.quote(path)}" in body
+    assert f"line_count >= {floor}" in body
+    assert "%if" not in cleaned
+    assert "line_count" not in cleaned
+    assert f"#split_file:{path}" in cleaned
+    return cleaned, body
+
+
+def _condition_body(path: str, floor: int) -> str:
+    return _parse_condition_prompt(_admission_prompt(path, floor), path, floor)[1]
+
+
+def _run_condition(repo: Path, body: str) -> int:
+    return subprocess.run(
+        ["bash", "-c", body],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    ).returncode
+
+
+def _write_lines(path: Path, count: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x\n" * count, encoding="utf-8")
+
+
+def _known_project_resolver(repo: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        workflow_type="git",
+        ref="demo",
+        workspace_dir=str(repo),
+        project_file=str(repo / "demo.sase"),
+    )
 
 
 def _fake_toobig(tmp_path: Path) -> Path:
@@ -123,51 +172,13 @@ def _assert_planned_prompts_use_medium_model(prompts: list[str]) -> None:
     assert all(getattr(directives, "model_alias", "medium") == "medium" for directives in parsed)
 
 
-def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "toobig-split-test",
-        "GIT_AUTHOR_EMAIL": "toobig-split-test@example.com",
-        "GIT_COMMITTER_NAME": "toobig-split-test",
-        "GIT_COMMITTER_EMAIL": "toobig-split-test@example.com",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_SYSTEM": os.devnull,
-        "GIT_TERMINAL_PROMPT": "0",
-    }
-    return subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.email=toobig-split-test@example.com",
-            "-c",
-            "user.name=toobig-split-test",
-            "-c",
-            "commit.gpgsign=false",
-            *args,
-        ],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-
-
-def _repo_head(repo: Path) -> str:
-    return _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
-
-
-def _prepare_repo(tmp_path: Path, *, git: bool = True) -> Path:
+def _prepare_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     (repo / "src/pkg").mkdir(parents=True)
     (repo / "tests").mkdir()
     (repo / "src/pkg/large.py").write_text("x = 1\n", encoding="utf-8")
     (repo / "src/pkg/shared.py").write_text("y = 2\n", encoding="utf-8")
     (repo / "tests/large.py").write_text("z = 3\n", encoding="utf-8")
-    if git:
-        _git("init", cwd=repo)
-        _git("add", ".", cwd=repo)
-        _git("commit", "-m", "initial", cwd=repo)
     return repo
 
 
@@ -374,11 +385,10 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert result["counters"] == {"files": 3, "proposals": 3, "trees": 2}
     proposals = result["proposed_launches"]
     _assert_raw_proposals_use_medium_model(proposals)
-    assert [proposal["prompt"] for proposal in proposals] == [
-        "%auto %wait(priority=20) #split_file:src/pkg/large.py",
-        "%auto %wait(priority=20) #split_file:src/pkg/shared.py",
-        "%auto %wait(priority=20) #split_file:tests/large.py",
-    ]
+    paths = ["src/pkg/large.py", "src/pkg/shared.py", "tests/large.py"]
+    for proposal, path in zip(proposals, paths, strict=True):
+        _parse_condition_prompt(proposal["prompt"], path, 700)
+    assert all(not proposal.get("dedupe_key") for proposal in proposals)
     assert proposals[0]["wait_on"] is None
     assert proposals[1]["wait_on"] == proposals[0]["id"]
     assert proposals[2]["wait_on"] == proposals[1]["id"]
@@ -400,9 +410,6 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert "src/pkg/shared.py" in summary_plain
     assert "tests/large.py" in summary_plain
     assert all(proposal["workspace"] == "gh:example/demo" for proposal in proposals)
-    head = _repo_head(repo)
-    assert len({proposal["dedupe_key"] for proposal in proposals}) == 3
-    assert all(proposal["dedupe_key"].endswith(f":{head}") for proposal in proposals)
     report_rows = next(block for block in result["report"]["blocks"] if block["kind"] == "rows")[
         "rows"
     ]
@@ -535,7 +542,8 @@ def test_custom_tree_limits_and_legacy_env_target_resolution(
     proposal = result["proposed_launches"][0]
     _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     assert proposal["workspace"] == "git:demo"
-    assert proposal["prompt"] == "%auto %wait(priority=20) #split_file:lib/large.py"
+    _parse_condition_prompt(proposal["prompt"], "lib/large.py", 70)
+    assert not proposal.get("dedupe_key")
     assert calls.read_text(encoding="utf-8").strip() == "--files-only lib 90 80 70"
 
 
@@ -660,7 +668,8 @@ def test_hard_limit_exit_1_emits_actionable_violation_proposal(
     assert result["counters"] == {"files": 1, "proposals": 1, "trees": 1}
     proposal = result["proposed_launches"][0]
     _assert_raw_proposals_use_medium_model(result["proposed_launches"])
-    assert proposal["prompt"] == "%auto %wait(priority=20) #split_file:src/pkg/large.py"
+    _parse_condition_prompt(proposal["prompt"], "src/pkg/large.py", 700)
+    assert not proposal.get("dedupe_key")
     assert proposal["agent_name"] == "split_file.src.pkg.large.@"
     assert proposal["clan"] == "toobig-@"
     summary_plain = Text.from_markup(proposal["clan_summary"]).plain
@@ -787,7 +796,7 @@ def test_scanner_failure_is_visible_as_check_error(
     validate_chop_result(result)
 
 
-def test_absolute_scanner_paths_are_normalized_and_missing_files_dedupe_on_revision(
+def test_absolute_scanner_paths_are_normalized_and_missing_files_are_condition_gated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     run_chop_main: Callable[..., dict[str, Any]],
@@ -810,13 +819,12 @@ def test_absolute_scanner_paths_are_normalized_and_missing_files_dedupe_on_revis
 
     proposals = result["proposed_launches"]
     _assert_raw_proposals_use_medium_model(proposals)
-    assert [proposal["prompt"] for proposal in proposals] == [
-        "%auto %wait(priority=20) #split_file:src/pkg/large.py",
-        "%auto %wait(priority=20) #split_file:src/pkg/missing.py",
-    ]
-    head = _repo_head(repo)
-    assert proposals[0]["dedupe_key"] == f"toobig_split:gh:example/demo:src/pkg/large.py:{head}"
-    assert proposals[1]["dedupe_key"] == f"toobig_split:gh:example/demo:src/pkg/missing.py:{head}"
+    _parse_condition_prompt(proposals[0]["prompt"], "src/pkg/large.py", 700)
+    _, missing_condition = _parse_condition_prompt(
+        proposals[1]["prompt"], "src/pkg/missing.py", 700
+    )
+    assert _run_condition(repo, missing_condition) == 1
+    assert all(not proposal.get("dedupe_key") for proposal in proposals)
     assert "· ?" in Text.from_markup(proposals[1]["clan_summary"]).plain
 
 
@@ -881,89 +889,178 @@ def test_toobig_never_calls_sase_or_creates_lock_state(
     assert list((tmp_path / "state").glob("*.lock")) == []
 
 
-def test_dedupe_keys_end_with_repository_head(
+@pytest.mark.parametrize(
+    ("line_count", "exit_code"),
+    [
+        (699, 1),
+        (700, 0),
+        (701, 0),
+    ],
+)
+def test_condition_body_gates_at_configured_floor(
+    tmp_path: Path,
+    line_count: int,
+    exit_code: int,
+) -> None:
+    repo = tmp_path / "repo"
+    path = "src/pkg/large.py"
+    _write_lines(repo / path, line_count)
+
+    assert _run_condition(repo, _condition_body(path, 700)) == exit_code
+
+
+def test_condition_body_skips_deleted_target(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    path = "src/pkg/large.py"
+    source = repo / path
+    _write_lines(source, 700)
+    body = _condition_body(path, 700)
+    source.unlink()
+
+    assert _run_condition(repo, body) == 1
+
+
+def test_condition_body_surfaces_read_failures(tmp_path: Path) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root can read chmod-000 files")
+    repo = tmp_path / "repo"
+    path = "src/pkg/unreadable.py"
+    source = repo / path
+    _write_lines(source, 700)
+    source.chmod(0)
+    try:
+        assert _run_condition(repo, _condition_body(path, 700)) not in {0, 1}
+    finally:
+        source.chmod(0o600)
+
+
+def test_condition_body_quotes_metacharacter_paths(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    path = "src/pkg/$(touch${IFS}INJECTED).py"
+    _write_lines(repo / path, 700)
+
+    body = _condition_body(path, 700)
+
+    assert f"path={shlex.quote(path)}" in body
+    assert _run_condition(repo, body) == 0
+    assert not (repo / "INJECTED").exists()
+
+
+def test_sase_bridge_skips_stale_queued_files_without_agent_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     run_chop_main: Callable[..., dict[str, Any]],
 ) -> None:
+    pytest.importorskip("sase_core_rs")
     repo = _prepare_repo(tmp_path)
-    head = _repo_head(repo)
-    result = _scan_three_files(tmp_path, monkeypatch, run_chop_main, repo)
-    proposals = result["proposed_launches"]
-    assert result["status"] == "ok"
-    assert [proposal["dedupe_key"] for proposal in proposals] == [
-        f"toobig_split:gh:example/demo:src/pkg/large.py:{head}",
-        f"toobig_split:gh:example/demo:src/pkg/shared.py:{head}",
-        f"toobig_split:gh:example/demo:tests/large.py:{head}",
-    ]
-    assert all(proposal["dedupe_key"].endswith(head) for proposal in proposals)
-
-
-def test_new_commit_changes_every_dedupe_key(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    run_chop_main: Callable[..., dict[str, Any]],
-) -> None:
-    repo = _prepare_repo(tmp_path)
-    first = _scan_three_files(tmp_path, monkeypatch, run_chop_main, repo)
-    keys_before = [proposal["dedupe_key"] for proposal in first["proposed_launches"]]
-    (repo / "note.txt").write_text("next\n", encoding="utf-8")
-    _git("add", "note.txt", cwd=repo)
-    _git("commit", "-m", "second", cwd=repo)
-    second = _scan_three_files(tmp_path, monkeypatch, run_chop_main, repo)
-    keys_after = [proposal["dedupe_key"] for proposal in second["proposed_launches"]]
-    head = _repo_head(repo)
-    assert keys_before != keys_after
-    assert len(keys_before) == len(keys_after) == 3
-    assert all(before != after for before, after in zip(keys_before, keys_after, strict=True))
-    assert all(key.endswith(f":{head}") for key in keys_after)
-    assert [proposal["prompt"] for proposal in second["proposed_launches"]] == [
-        proposal["prompt"] for proposal in first["proposed_launches"]
-    ]
-
-
-def test_non_git_repo_omits_dedupe_keys(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    run_chop_main: Callable[..., dict[str, Any]],
-) -> None:
-    repo = _prepare_repo(tmp_path, git=False)
-    result = _scan_three_files(tmp_path, monkeypatch, run_chop_main, repo)
-    proposals = result["proposed_launches"]
-    assert result["status"] == "ok"
-    assert [proposal["prompt"] for proposal in proposals] == [
-        "%auto %wait(priority=20) #split_file:src/pkg/large.py",
-        "%auto %wait(priority=20) #split_file:src/pkg/shared.py",
-        "%auto %wait(priority=20) #split_file:tests/large.py",
-    ]
-    assert proposals[0]["wait_on"] is None
-    assert proposals[1]["wait_on"] == proposals[0]["id"]
-    assert proposals[2]["wait_on"] == proposals[1]["id"]
-    # Result validation may materialize omitted optionals as null; fail-open means
-    # no usable key either way.
-    assert all(not proposal.get("dedupe_key") for proposal in proposals)
-
-
-def test_repo_revision_returns_none_for_non_git_directory(tmp_path: Path) -> None:
-    assert _repo_revision(tmp_path) is None
-
-
-def test_repo_revision_returns_none_when_git_is_missing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    empty_bin = tmp_path / "no-git"
-    empty_bin.mkdir()
-    monkeypatch.setenv("PATH", str(empty_bin))
-    assert _repo_revision(tmp_path) is None
-
-
-def test_repo_revision_returns_none_when_git_prints_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        "bugyi_chops.toobig_split._run_command",
-        lambda *_args, **_kwargs: subprocess.CompletedProcess(
-            ["git"], returncode=0, stdout="   \n", stderr=""
-        ),
+    paths = ["src/pkg/large.py", "src/pkg/shared.py"]
+    for path in paths:
+        _write_lines(repo / path, 701)
+    scanner = _fake_toobig(tmp_path)
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", "".join(f"{path}\n" for path in paths))
+    result = run_chop_main(
+        main,
+        tmp_path,
+        monkeypatch,
+        target=_target(repo),
+        variables={"toobig": str(scanner), "trees": ["src"]},
     )
-    assert _repo_revision(tmp_path) is None
+    for path in paths:
+        _write_lines(repo / path, 699)
+    monkeypatch.setenv("SASE_HOME", str(tmp_path / ".sase"))
+    monkeypatch.setattr(
+        "sase.agent.launch_cwd_common.resolve_known_project_vcs_launch_ref",
+        lambda _prompt: _known_project_resolver(repo),
+    )
+
+    def _unexpected_launch(*_args: object, **_kwargs: object) -> list[object]:
+        raise AssertionError("stale toobig_split proposal allocated an agent")
+
+    with override_flags(typed_launch_units=True):
+        launches = launch_chop_proposals(
+            lumberjack_name="maintenance",
+            chop_name="toobig_split",
+            run_id="run-stale",
+            proposals=prepare_chop_proposals("toobig_split", result),
+            launch_agent_from_cwd_fn=_unexpected_launch,
+            launch_agents_from_cwd_fn=_unexpected_launch,
+        )
+
+    summary = launches.admission_result.summary
+    assert list(launches) == []
+    assert launches.typed_admission is not None
+    assert launches.admission_result.admission_complete
+    assert summary is not None
+    assert summary.total == 2
+    assert summary.launched == 0
+    assert summary.skipped == 2
+    assert summary.condition_errors == 0
+    assert summary.launch_errors == 0
+
+
+def test_sase_bridge_launches_eligible_file_after_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+) -> None:
+    pytest.importorskip("sase_core_rs")
+    repo = _prepare_repo(tmp_path)
+    path = "src/pkg/large.py"
+    _write_lines(repo / path, 700)
+    scanner = _fake_toobig(tmp_path)
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", f"{path}\n")
+    result = run_chop_main(
+        main,
+        tmp_path,
+        monkeypatch,
+        target=_target(repo),
+        variables={"toobig": str(scanner), "trees": ["src"]},
+    )
+    monkeypatch.setenv("SASE_HOME", str(tmp_path / ".sase"))
+    monkeypatch.setattr(
+        "sase.agent.launch_cwd_common.resolve_known_project_vcs_launch_ref",
+        lambda _prompt: _known_project_resolver(repo),
+    )
+    dispatched: list[str] = []
+
+    def _launch(prompt: str, *, extra_env: dict[str, str]) -> list[SimpleNamespace]:
+        dispatched.append(prompt)
+        assert extra_env["SASE_CHOP_NAME"] == "toobig_split"
+        return [
+            SimpleNamespace(
+                pid=501,
+                agent_name="toobig-0.split_file.src.pkg.large.0",
+                workspace_num=2,
+                workspace_dir=str(repo),
+                project_name="demo",
+                workflow_name="ace(run)-260823_120000",
+                cl_name="demo",
+                timestamp="260823_120000",
+                artifacts_dir=str(tmp_path / "artifacts" / "20260823120000"),
+            )
+        ]
+
+    with override_flags(typed_launch_units=True):
+        launches = launch_chop_proposals(
+            lumberjack_name="maintenance",
+            chop_name="toobig_split",
+            run_id="run-eligible",
+            proposals=prepare_chop_proposals("toobig_split", result),
+            launch_agent_from_cwd_fn=lambda *_args, **_kwargs: None,
+            launch_agents_from_cwd_fn=_launch,
+        )
+
+    summary = launches.admission_result.summary
+    assert len(launches) == 1
+    assert launches.typed_admission is not None
+    assert launches.admission_result.admission_complete
+    assert summary is not None
+    assert summary.launched == 1
+    assert summary.skipped == 0
+    assert summary.condition_errors == 0
+    assert summary.launch_errors == 0
+    assert len(dispatched) == 1
+    assert "%if" not in dispatched[0]
+    assert "line_count" not in dispatched[0]

@@ -7,13 +7,13 @@ propose maintenance work. It supplies two console scripts:
 | Script | Responsibility |
 | --- | --- |
 | `bugyi_chop_ci_watch` | Notify on CI failures and squash-merge explicitly enabled, guarded release-please PRs |
-| `bugyi_chop_toobig_split` | One sequential `%auto #split_file:<path>` agent per oversized Python file, routed through `@medium` |
+| `bugyi_chop_toobig_split` | One sequential condition-gated `%auto #split_file:<path>` agent per oversized Python file, routed through `@medium` |
 
 The scripts never launch agents themselves. `bugyi_chop_toobig_split` scans and
 assembles prompts, then uses the public `sase.chops` SDK to atomically write a
-validated result document; Axe owns guard and trigger evaluation, deduplication,
-workspace allocation, proposal launches, and the final action lifecycle for those
-proposals.
+validated result document; Axe owns guard and trigger evaluation, keyed-proposal
+deduplication, workspace allocation, proposal launches, and the final action lifecycle
+for those proposals.
 
 `bugyi_chop_ci_watch` is deliberately narrower. It never creates gates, launch
 requests, repair prompts, or Axe proposals. Its only mutation outside its own state and
@@ -36,9 +36,9 @@ For development against the repository rather than PyPI:
 sase plugin install bugyi-chops -g
 ```
 
-All scripts require Python 3.12 or newer and `sase>=0.13.2,<0.14`. SASE 0.13.2 is the
-first release with structured chop reports. The package also
-installs the `toobig` scanner used by `bugyi_chop_toobig_split`.
+All scripts require Python 3.12 or newer and `sase>=0.16.0,<0.17`. SASE 0.16.0 is the
+first compatible release series for typed Axe chop admission with `%if`. The package
+also installs the `toobig` scanner used by `bugyi_chop_toobig_split`.
 
 ## The chop result contract
 
@@ -54,7 +54,7 @@ Axe invokes a configured script as `<script> --context <context.json>` and suppl
   "proposed_launches": [
     {
       "id": "split_file-src-large_py",
-      "prompt": "%auto #split_file:src/large.py",
+      "prompt": "%if::\n```bash\npath=src/large.py\n...\n```\n%auto #split_file:src/large.py",
       "workspace": "gh:sase-org/sase",
       "model": "@medium"
     }
@@ -138,19 +138,29 @@ Each proposal has:
   counts, configured limits, and sequential queue;
 - structured `model: "@medium"`, which Axe renders as one `%model:@medium`
   directive alongside `%auto #split_file:<path>`;
-- `%auto #split_file:<path>` as its prompt;
-- a content-sensitive dedupe key, so an unchanged file is not relaunched;
+- one `%if::` Bash fence followed by `%auto #split_file:<path>` as its prompt;
+- no proposal `dedupe_key`; every scheduled scan may reconsider files that remain
+  oversized;
 - `wait_on` pointing to the prior file, preserving sequential workspace allocation.
+
+The `%if` fence runs after the proposal's sequential wait and immediately before typed
+admission. It skips without allocating an agent, runner, workspace, or model request
+when the target file is gone or has dropped below the configured floor (`min(limits)`,
+700 lines in the default configuration). A read/count failure for an existing file is a
+visible condition error. This requires SASE's `typed_launch_units` flag and a compatible
+SASE 0.16.x runtime; older SASE 0.13.x runtimes reject these directives before model
+dispatch.
 
 The structured `@medium` field is the only model source. It selects SASE's
 configurable, load-balanced alias pool rather than pinning a concrete
 provider/model in the prompt body, so operators retune `@medium` centrally
 without a per-chop model variable.
 
-The repeated summary metadata is deliberate: after deduplication, any surviving
-proposal can safely become the clan declarer. Axe allocates the concrete clan template
-once per actionable scan and emits the summary exactly once on that declaration; clan
-joiners do not redeclare it. In ACE the default scan reads as:
+The repeated summary metadata is deliberate: after conditional admission or any other
+proposal filtering, any surviving proposal can safely become the clan declarer. Axe
+allocates the concrete clan template once per actionable scan and emits the summary
+exactly once on that declaration; clan joiners do not redeclare it. In ACE the default
+scan reads as:
 
 ```text
 ◆ TOOBIG SPLIT · 3 FILES
@@ -190,9 +200,10 @@ axe:
             Runs `bugyi_chop_toobig_split` once per hour for the `sase` target and scans the configured `src` and
             `tests` trees with the `1000`, `850`, and `700` line limits.
 
-            Each actionable scan emits content-deduped `%auto #split_file:<path>` proposals in a sequential `toobig-`
-            clan, so one oversized file is handled before the next claim starts. The chop sets the structured proposal
-            model to `@medium`; Axe emits `%model:@medium` and SASE consumes the alias pool at each real invocation.
+            Each actionable scan emits sequential `toobig-` clan proposals. Every member rechecks the configured
+            700-line floor through `%if` after its wait and before admission, so stale files skip without allocating an
+            agent while still-oversized files launch normally. The chop sets the structured proposal model to `@medium`;
+            Axe emits `%model:@medium` and SASE consumes the alias pool at each real invocation.
           run_every: 60m
           inhibit_if:
             agent_clan: {name_prefix: toobig-}
