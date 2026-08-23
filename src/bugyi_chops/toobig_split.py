@@ -325,13 +325,21 @@ def _agent_name(path: str) -> str:
     return f"split_file.{slug}.@"
 
 
-def _dedupe_key(repo_root: Path, workspace: str, path: str) -> str:
-    target = repo_root / path
+def _repo_revision(repo_root: Path) -> str | None:
     try:
-        content_digest = hashlib.sha256(target.read_bytes()).hexdigest()[:16]
-    except OSError:
-        content_digest = "missing"
-    return f"toobig_split:{workspace}:{path}:{content_digest}"
+        result = _run_command(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
+    except RuntimeError:
+        return None
+    if result.returncode != 0:
+        return None
+    revision = result.stdout.strip()
+    return revision or None
+
+
+def _dedupe_key(workspace: str, path: str, revision: str | None) -> str | None:
+    if revision is None:
+        return None
+    return f"toobig_split:{workspace}:{path}:{revision}"
 
 
 def _line_count(path: Path) -> int | None:
@@ -530,6 +538,7 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
         report=_build_report(rows, overflow, len(trees), limits),
     )
     clan_summary = _render_clan_summary(entries, len(trees), limits)
+    revision = _repo_revision(target.repo_root)
     prior_id: str | None = None
     for path in files:
         proposal_id = f"split-{_path_digest(path)}"
@@ -541,7 +550,7 @@ def build_result(invocation: ChopInvocation) -> ChopResultBuilder:
             clan=CLAN_TEMPLATE,
             clan_summary=clan_summary,
             model=PROPOSAL_MODEL,
-            dedupe_key=_dedupe_key(target.repo_root, target.workspace, path),
+            dedupe_key=_dedupe_key(target.workspace, path, revision),
             wait_on=prior_id,
         )
         prior_id = proposal_id

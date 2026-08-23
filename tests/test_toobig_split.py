@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
@@ -32,6 +33,7 @@ from bugyi_chops.toobig_split import (
     _elide_path,
     _line_count,
     _render_clan_summary,
+    _repo_revision,
     main,
 )
 
@@ -121,14 +123,71 @@ def _assert_planned_prompts_use_medium_model(prompts: list[str]) -> None:
     assert all(getattr(directives, "model_alias", "medium") == "medium" for directives in parsed)
 
 
-def _prepare_repo(tmp_path: Path) -> Path:
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "toobig-split-test",
+        "GIT_AUTHOR_EMAIL": "toobig-split-test@example.com",
+        "GIT_COMMITTER_NAME": "toobig-split-test",
+        "GIT_COMMITTER_EMAIL": "toobig-split-test@example.com",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    return subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=toobig-split-test@example.com",
+            "-c",
+            "user.name=toobig-split-test",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _repo_head(repo: Path) -> str:
+    return _git("rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+
+def _prepare_repo(tmp_path: Path, *, git: bool = True) -> Path:
     repo = tmp_path / "repo"
     (repo / "src/pkg").mkdir(parents=True)
     (repo / "tests").mkdir()
     (repo / "src/pkg/large.py").write_text("x = 1\n", encoding="utf-8")
     (repo / "src/pkg/shared.py").write_text("y = 2\n", encoding="utf-8")
     (repo / "tests/large.py").write_text("z = 3\n", encoding="utf-8")
+    if git:
+        _git("init", cwd=repo)
+        _git("add", ".", cwd=repo)
+        _git("commit", "-m", "initial", cwd=repo)
     return repo
+
+
+def _scan_three_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+    repo: Path,
+) -> dict[str, Any]:
+    scanner = _fake_toobig(tmp_path)
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", "src/pkg/large.py\\nsrc/pkg/shared.py\\n")
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_TESTS", "tests/large.py\\n")
+    return run_chop_main(
+        main,
+        tmp_path,
+        monkeypatch,
+        target=_target(repo),
+        variables={"toobig": str(scanner)},
+    )
 
 
 def test_clan_summary_has_canonical_text_styles_and_width() -> None:
@@ -341,7 +400,9 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert "src/pkg/shared.py" in summary_plain
     assert "tests/large.py" in summary_plain
     assert all(proposal["workspace"] == "gh:example/demo" for proposal in proposals)
+    head = _repo_head(repo)
     assert len({proposal["dedupe_key"] for proposal in proposals}) == 3
+    assert all(proposal["dedupe_key"].endswith(f":{head}") for proposal in proposals)
     report_rows = next(block for block in result["report"]["blocks"] if block["kind"] == "rows")[
         "rows"
     ]
@@ -726,7 +787,7 @@ def test_scanner_failure_is_visible_as_check_error(
     validate_chop_result(result)
 
 
-def test_absolute_scanner_paths_are_normalized_and_missing_files_still_dedupe(
+def test_absolute_scanner_paths_are_normalized_and_missing_files_dedupe_on_revision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     run_chop_main: Callable[..., dict[str, Any]],
@@ -753,7 +814,9 @@ def test_absolute_scanner_paths_are_normalized_and_missing_files_still_dedupe(
         "%auto %wait(priority=20) #split_file:src/pkg/large.py",
         "%auto %wait(priority=20) #split_file:src/pkg/missing.py",
     ]
-    assert proposals[1]["dedupe_key"].endswith(":missing")
+    head = _repo_head(repo)
+    assert proposals[0]["dedupe_key"] == f"toobig_split:gh:example/demo:src/pkg/large.py:{head}"
+    assert proposals[1]["dedupe_key"] == f"toobig_split:gh:example/demo:src/pkg/missing.py:{head}"
     assert "· ?" in Text.from_markup(proposals[1]["clan_summary"]).plain
 
 
@@ -816,3 +879,91 @@ def test_toobig_never_calls_sase_or_creates_lock_state(
     assert result["status"] == "ok"
     _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     assert list((tmp_path / "state").glob("*.lock")) == []
+
+
+def test_dedupe_keys_end_with_repository_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+) -> None:
+    repo = _prepare_repo(tmp_path)
+    head = _repo_head(repo)
+    result = _scan_three_files(tmp_path, monkeypatch, run_chop_main, repo)
+    proposals = result["proposed_launches"]
+    assert result["status"] == "ok"
+    assert [proposal["dedupe_key"] for proposal in proposals] == [
+        f"toobig_split:gh:example/demo:src/pkg/large.py:{head}",
+        f"toobig_split:gh:example/demo:src/pkg/shared.py:{head}",
+        f"toobig_split:gh:example/demo:tests/large.py:{head}",
+    ]
+    assert all(proposal["dedupe_key"].endswith(head) for proposal in proposals)
+
+
+def test_new_commit_changes_every_dedupe_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+) -> None:
+    repo = _prepare_repo(tmp_path)
+    first = _scan_three_files(tmp_path, monkeypatch, run_chop_main, repo)
+    keys_before = [proposal["dedupe_key"] for proposal in first["proposed_launches"]]
+    (repo / "note.txt").write_text("next\n", encoding="utf-8")
+    _git("add", "note.txt", cwd=repo)
+    _git("commit", "-m", "second", cwd=repo)
+    second = _scan_three_files(tmp_path, monkeypatch, run_chop_main, repo)
+    keys_after = [proposal["dedupe_key"] for proposal in second["proposed_launches"]]
+    head = _repo_head(repo)
+    assert keys_before != keys_after
+    assert len(keys_before) == len(keys_after) == 3
+    assert all(before != after for before, after in zip(keys_before, keys_after, strict=True))
+    assert all(key.endswith(f":{head}") for key in keys_after)
+    assert [proposal["prompt"] for proposal in second["proposed_launches"]] == [
+        proposal["prompt"] for proposal in first["proposed_launches"]
+    ]
+
+
+def test_non_git_repo_omits_dedupe_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+) -> None:
+    repo = _prepare_repo(tmp_path, git=False)
+    result = _scan_three_files(tmp_path, monkeypatch, run_chop_main, repo)
+    proposals = result["proposed_launches"]
+    assert result["status"] == "ok"
+    assert [proposal["prompt"] for proposal in proposals] == [
+        "%auto %wait(priority=20) #split_file:src/pkg/large.py",
+        "%auto %wait(priority=20) #split_file:src/pkg/shared.py",
+        "%auto %wait(priority=20) #split_file:tests/large.py",
+    ]
+    assert proposals[0]["wait_on"] is None
+    assert proposals[1]["wait_on"] == proposals[0]["id"]
+    assert proposals[2]["wait_on"] == proposals[1]["id"]
+    # Result validation may materialize omitted optionals as null; fail-open means
+    # no usable key either way.
+    assert all(not proposal.get("dedupe_key") for proposal in proposals)
+
+
+def test_repo_revision_returns_none_for_non_git_directory(tmp_path: Path) -> None:
+    assert _repo_revision(tmp_path) is None
+
+
+def test_repo_revision_returns_none_when_git_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty_bin = tmp_path / "no-git"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    assert _repo_revision(tmp_path) is None
+
+
+def test_repo_revision_returns_none_when_git_prints_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "bugyi_chops.toobig_split._run_command",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["git"], returncode=0, stdout="   \n", stderr=""
+        ),
+    )
+    assert _repo_revision(tmp_path) is None
