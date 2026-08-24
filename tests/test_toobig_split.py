@@ -15,12 +15,14 @@ import pytest
 from rich.cells import cell_len
 from rich.style import Style
 from rich.text import Text
+from sase.agent.names import iter_agent_name_key_markers
 from sase.axe.chop_proposal_launch import launch_chop_proposals
 from sase.axe.chop_proposals import plan_chop_proposals, prepare_chop_proposals
 from sase.core.axe_chop_facade import validate_chop_result
 from sase.feature_flags import override_flags
 from sase.xprompt.directives import extract_prompt_directives
 
+from bugyi_chops._common import safe_fragment
 from bugyi_chops.toobig_split import (
     CLAN_SUMMARY_FACTS_STYLE,
     CLAN_SUMMARY_FYI_STYLE,
@@ -35,8 +37,10 @@ from bugyi_chops.toobig_split import (
     PROPOSAL_MODEL,
     FileEntry,
     _admission_prompt,
+    _agent_name,
     _elide_path,
     _line_count,
+    _path_digest,
     _render_clan_summary,
     main,
 )
@@ -170,6 +174,60 @@ def _assert_planned_prompts_use_medium_model(prompts: list[str]) -> None:
     parsed = [extract_prompt_directives(prompt)[1] for prompt in prompts]
     assert all(directives.model == "medium" for directives in parsed)
     assert all(getattr(directives, "model_alias", "medium") == "medium" for directives in parsed)
+
+
+def _keyed_markers(value: str) -> list[str]:
+    return [
+        marker.id
+        for marker in iter_agent_name_key_markers(value)
+        if marker.braced and marker.id is not None
+    ]
+
+
+def _assert_keyed_basename_template(agent_name: str, path: str) -> None:
+    assert agent_name == _agent_name(path)
+    assert _keyed_markers(agent_name) == [_path_digest(path)]
+    slug = safe_fragment(Path(path).stem, fallback="file")
+    assert agent_name == f"{slug}.{{@{_path_digest(path)}}}"
+    assert "split_file." not in agent_name
+    assert "/" not in agent_name
+    assert "\\" not in agent_name
+
+
+def _freeze_agent_name_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sase.agent.names as agent_names
+
+    monkeypatch.setattr(agent_names, "get_reserved_agent_names", set)
+    monkeypatch.setattr(agent_names, "get_reserved_clan_names", set)
+    monkeypatch.setattr(agent_names, "get_reserved_family_names", set)
+    monkeypatch.setattr(agent_names, "agent_name_allocation_lock", nullcontext)
+
+
+def _capturing_launcher(
+    dispatched: list[str],
+    tmp_path: Path,
+    repo: Path,
+) -> Callable[..., list[SimpleNamespace]]:
+    def _launch(prompt: str, *, extra_env: dict[str, str]) -> list[SimpleNamespace]:
+        dispatched.append(prompt)
+        assert extra_env["SASE_CHOP_NAME"] == "toobig_split"
+        directives = extract_prompt_directives(prompt)[1]
+        name = directives.name or f"captured-{len(dispatched)}"
+        return [
+            SimpleNamespace(
+                pid=500 + len(dispatched),
+                agent_name=name,
+                workspace_num=2,
+                workspace_dir=str(repo),
+                project_name="demo",
+                workflow_name="ace(run)-260823_120000",
+                cl_name="demo",
+                timestamp="260823_120000",
+                artifacts_dir=str(tmp_path / "artifacts" / "20260823120000"),
+            )
+        ]
+
+    return _launch
 
 
 def _prepare_repo(tmp_path: Path) -> Path:
@@ -392,15 +450,11 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     assert proposals[0]["wait_on"] is None
     assert proposals[1]["wait_on"] == proposals[0]["id"]
     assert proposals[2]["wait_on"] == proposals[1]["id"]
-    assert [proposal["agent_name"] for proposal in proposals] == [
-        "split_file.src.pkg.large.@",
-        "split_file.src.pkg.shared.@",
-        "split_file.tests.large.@",
-    ]
-    assert all(
-        proposal["agent_name"].endswith(".@") and proposal["agent_name"].count("@") == 1
-        for proposal in proposals
-    )
+    for proposal, path in zip(proposals, paths, strict=True):
+        _assert_keyed_basename_template(proposal["agent_name"], path)
+    assert proposals[0]["agent_name"] != proposals[2]["agent_name"]
+    assert proposals[0]["agent_name"].startswith("large.{@")
+    assert proposals[2]["agent_name"].startswith("large.{@")
     assert all(proposal["clan"] == "toobig-@" for proposal in proposals)
     assert {proposal["clan_summary"] for proposal in proposals} == {proposals[0]["clan_summary"]}
     summary_plain = Text.from_markup(proposals[0]["clan_summary"]).plain
@@ -426,7 +480,7 @@ def test_scan_deduplicates_files_and_emits_stable_wait_chain(
     ]
 
 
-def test_scan_agent_name_keeps_full_safe_dotted_module_path(
+def test_scan_agent_name_uses_keyed_basename_not_parent_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     run_chop_main: Callable[..., dict[str, Any]],
@@ -449,9 +503,10 @@ def test_scan_agent_name_keeps_full_safe_dotted_module_path(
 
     assert result["status"] == "ok"
     _assert_raw_proposals_use_medium_model(result["proposed_launches"])
-    assert [proposal["agent_name"] for proposal in result["proposed_launches"]] == [
-        "split_file.src.pkg.section_abcdefghijklmnopqrstuvwxyz0123456789.trailing_module.@"
-    ]
+    name = result["proposed_launches"][0]["agent_name"]
+    _assert_keyed_basename_template(name, long_path)
+    assert name.startswith("trailing_module.{@")
+    assert "section_abcdefghijklmnopqrstuvwxyz0123456789" not in name
 
 
 def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
@@ -477,19 +532,14 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
     assert {proposal.clan_summary for proposal in prepared} == {authored_summary}
     assert all(proposal.model == PROPOSAL_MODEL for proposal in prepared)
 
-    import sase.agent.names as agent_names
-
-    monkeypatch.setattr(agent_names, "get_reserved_agent_names", set)
-    monkeypatch.setattr(agent_names, "get_reserved_clan_names", set)
-    monkeypatch.setattr(agent_names, "get_reserved_family_names", set)
-    monkeypatch.setattr(agent_names, "agent_name_allocation_lock", nullcontext)
+    _freeze_agent_name_allocation(monkeypatch)
 
     plans = plan_chop_proposals(prepared)
     assert [plan.clan for plan in plans] == ["toobig-0"] * 3
     assert [plan.agent_name for plan in plans] == [
-        "toobig-0.split_file.src.pkg.large.0",
-        "toobig-0.split_file.src.pkg.shared.0",
-        "toobig-0.split_file.tests.large.0",
+        "toobig-0.large.0",
+        "toobig-0.shared.0",
+        "toobig-0.large.1",
     ]
     assert [plan.declares_clan for plan in plans] == [True, False, False]
     assert [plan.clan_summary for plan in plans] == [authored_summary, None, None]
@@ -510,8 +560,8 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
     accepted_tail = [replace(prepared[1], wait_on=None), *prepared[2:]]
     tail_plans = plan_chop_proposals(accepted_tail)
     assert [plan.agent_name for plan in tail_plans] == [
-        "toobig-0.split_file.src.pkg.shared.0",
-        "toobig-0.split_file.tests.large.0",
+        "toobig-0.shared.0",
+        "toobig-0.large.0",
     ]
     assert [plan.declares_clan for plan in tail_plans] == [True, False]
     assert [plan.clan_summary for plan in tail_plans] == [authored_summary, None]
@@ -670,7 +720,7 @@ def test_hard_limit_exit_1_emits_actionable_violation_proposal(
     _assert_raw_proposals_use_medium_model(result["proposed_launches"])
     _parse_condition_prompt(proposal["prompt"], "src/pkg/large.py", 700)
     assert not proposal.get("dedupe_key")
-    assert proposal["agent_name"] == "split_file.src.pkg.large.@"
+    _assert_keyed_basename_template(proposal["agent_name"], "src/pkg/large.py")
     assert proposal["clan"] == "toobig-@"
     summary_plain = Text.from_markup(proposal["clan_summary"]).plain
     assert "◆ TOOBIG SPLIT · 1 FILE" in summary_plain
@@ -946,6 +996,19 @@ def test_condition_body_quotes_metacharacter_paths(tmp_path: Path) -> None:
     assert not (repo / "INJECTED").exists()
 
 
+def test_agent_name_key_is_stable_and_collision_safe_for_shared_basenames() -> None:
+    first = "src/pkg/large.py"
+    second = "tests/large.py"
+    first_name = _agent_name(first)
+    second_name = _agent_name(second)
+
+    _assert_keyed_basename_template(first_name, first)
+    _assert_keyed_basename_template(second_name, second)
+    assert first_name == _agent_name(first)
+    assert first_name != second_name
+    assert _keyed_markers(first_name) != _keyed_markers(second_name)
+
+
 def test_sase_bridge_skips_stale_queued_files_without_agent_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1024,32 +1087,26 @@ def test_sase_bridge_launches_eligible_file_after_admission(
         lambda _prompt: _known_project_resolver(repo),
     )
     dispatched: list[str] = []
-
-    def _launch(prompt: str, *, extra_env: dict[str, str]) -> list[SimpleNamespace]:
-        dispatched.append(prompt)
-        assert extra_env["SASE_CHOP_NAME"] == "toobig_split"
-        return [
-            SimpleNamespace(
-                pid=501,
-                agent_name="toobig-0.split_file.src.pkg.large.0",
-                workspace_num=2,
-                workspace_dir=str(repo),
-                project_name="demo",
-                workflow_name="ace(run)-260823_120000",
-                cl_name="demo",
-                timestamp="260823_120000",
-                artifacts_dir=str(tmp_path / "artifacts" / "20260823120000"),
-            )
-        ]
+    authored_summary = result["proposed_launches"][0]["clan_summary"]
+    _freeze_agent_name_allocation(monkeypatch)
+    prepared = prepare_chop_proposals("toobig_split", result)
+    plans = plan_chop_proposals(prepared)
+    planned = extract_prompt_directives(plans[0].prompt)[1]
+    assert plans[0].agent_name == "toobig-0.large.0"
+    assert planned.clan == "toobig-0"
+    assert planned.clan_declared is True
+    assert planned.clan_tribe == "chop"
+    assert planned.clan_summary == authored_summary
 
     with override_flags(typed_launch_units=True):
         launches = launch_chop_proposals(
             lumberjack_name="maintenance",
             chop_name="toobig_split",
             run_id="run-eligible",
-            proposals=prepare_chop_proposals("toobig_split", result),
+            proposals=prepared,
+            launch_plans=plans,
             launch_agent_from_cwd_fn=lambda *_args, **_kwargs: None,
-            launch_agents_from_cwd_fn=_launch,
+            launch_agents_from_cwd_fn=_capturing_launcher(dispatched, tmp_path, repo),
         )
 
     summary = launches.admission_result.summary
@@ -1064,3 +1121,84 @@ def test_sase_bridge_launches_eligible_file_after_admission(
     assert len(dispatched) == 1
     assert "%if" not in dispatched[0]
     assert "line_count" not in dispatched[0]
+    directives = extract_prompt_directives(dispatched[0])[1]
+    assert directives.name == "toobig-0.large.0"
+    assert "split_file" not in (directives.name or "")
+    assert launches[0]["clan"] == "toobig-0"
+    assert launches[0]["member_id"] == "large.0"
+    assert launches[0]["agent_name"] == directives.name
+
+
+def test_sase_bridge_promotes_next_basename_member_when_first_skips(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_chop_main: Callable[..., dict[str, Any]],
+) -> None:
+    pytest.importorskip("sase_core_rs")
+    repo = _prepare_repo(tmp_path)
+    paths = ["src/pkg/large.py", "src/pkg/shared.py"]
+    for path in paths:
+        _write_lines(repo / path, 701)
+    scanner = _fake_toobig(tmp_path)
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
+    monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", "".join(f"{path}\n" for path in paths))
+    result = run_chop_main(
+        main,
+        tmp_path,
+        monkeypatch,
+        target=_target(repo),
+        variables={"toobig": str(scanner), "trees": ["src"]},
+    )
+    authored_summary = result["proposed_launches"][0]["clan_summary"]
+    _write_lines(repo / paths[0], 699)
+    monkeypatch.setenv("SASE_HOME", str(tmp_path / ".sase"))
+    monkeypatch.setattr(
+        "sase.agent.launch_cwd_common.resolve_known_project_vcs_launch_ref",
+        lambda _prompt: _known_project_resolver(repo),
+    )
+    dispatched: list[str] = []
+    _freeze_agent_name_allocation(monkeypatch)
+    prepared = prepare_chop_proposals("toobig_split", result)
+    plans = plan_chop_proposals(prepared)
+    assert [plan.agent_name for plan in plans] == ["toobig-0.large.0", "toobig-0.shared.0"]
+    assert [plan.declares_clan for plan in plans] == [True, False]
+    tail_plans = plan_chop_proposals([replace(prepared[1], wait_on=None)])
+    tail = extract_prompt_directives(tail_plans[0].prompt)[1]
+    assert tail_plans[0].agent_name == "toobig-0.shared.0"
+    assert tail_plans[0].declares_clan is True
+    assert tail.clan == "toobig-0"
+    assert tail.clan_declared is True
+    assert tail.clan_tribe == "chop"
+    assert tail.clan_summary == authored_summary
+
+    with override_flags(typed_launch_units=True):
+        launches = launch_chop_proposals(
+            lumberjack_name="maintenance",
+            chop_name="toobig_split",
+            run_id="run-promote",
+            proposals=prepared,
+            launch_plans=plans,
+            launch_agent_from_cwd_fn=lambda *_args, **_kwargs: None,
+            launch_agents_from_cwd_fn=_capturing_launcher(dispatched, tmp_path, repo),
+        )
+
+    summary = launches.admission_result.summary
+    assert len(launches) == 1
+    assert launches.typed_admission is not None
+    assert launches.admission_result.admission_complete
+    assert summary is not None
+    assert summary.total == 2
+    assert summary.launched == 1
+    assert summary.skipped == 1
+    assert summary.condition_errors == 0
+    assert summary.launch_errors == 0
+    assert len(dispatched) == 1
+    assert "%if" not in dispatched[0]
+    directives = extract_prompt_directives(dispatched[0])[1]
+    assert directives.name is not None
+    assert "shared" in directives.name
+    assert "large" not in directives.name
+    assert "split_file" not in directives.name
+    assert launches[0]["clan"] == "toobig-0"
+    assert launches[0]["member_id"] == "shared.0"
+    assert launches[0]["agent_name"] == directives.name

@@ -132,8 +132,8 @@ nonzero status, remain a typed `check_error`.
 
 Each proposal has:
 
-- the shared `toobig-@` clan template, with a stable marker-free `split_file.*`
-  member ID;
+- the shared `toobig-@` clan template, with a keyed basename member template
+  (`<basename>.{@<path-digest>}`);
 - the same Rich `clan_summary` metadata, describing the mission, file and scan-root
   counts, configured limits, and sequential queue;
 - structured `model: "@medium"`, which Axe renders as one `%model:@medium`
@@ -170,11 +170,14 @@ without changing behavior.
 2 scan roots · limits 1,000 / 850 / 700 lines · sequential queue
 ```
 
-Concrete agent names look like
-`toobig-<token>.split_file.<path-slug>.<digest>`. All proposals from that scan
-belong to the same clan generation, while later scans can allocate a new one. The
-plugin authors only the `toobig-@` template and proposal metadata; Axe alone chooses
-the concrete clan name, injects declaration/join directives, and launches agents.
+Concrete agent names look like `toobig-<token>.<basename>.<token>`, for example
+`toobig-3j.test_query_profile.0`. Two files that share a basename keep the same
+readable stem and allocate distinct member tokens (`.0`, `.1`) inside that clan.
+All proposals from that scan belong to the same clan generation, while later scans
+can allocate a new one. The plugin authors only the `toobig-@` clan template, a
+keyed basename member template, and proposal metadata; it never inspects live
+agents or chooses concrete tokens. Axe alone allocates the clan and member
+tokens, injects declaration/join directives, and launches agents.
 
 The script deliberately has no flock, no `sase agent list`, and no `sase run`. Those
 responsibilities now belong to Axe:

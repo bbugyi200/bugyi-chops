@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -320,9 +319,8 @@ def _path_digest(path: str) -> str:
 
 
 def _agent_name(path: str) -> str:
-    stem = Path(path).with_suffix("").as_posix()
-    slug = safe_fragment(re.sub(r"[/\\]+", ".", stem), fallback="file")
-    return f"split_file.{slug}.@"
+    slug = safe_fragment(Path(path).stem, fallback="file")
+    return f"{slug}.{{@{_path_digest(path)}}}"
 
 
 def _admission_prompt(path: str, floor: int) -> str:
