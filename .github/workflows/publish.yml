@@ -62,13 +62,14 @@ jobs:
         with:
           name: python-package
           path: dist/
+          if-no-files-found: error
 
   publish:
     needs: build
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/bugyi-chops
+      url: https://pypi.org/project/bugyi-chops/
     permissions:
       id-token: write
     steps:
@@ -77,3 +78,5 @@ jobs:
           name: python-package
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

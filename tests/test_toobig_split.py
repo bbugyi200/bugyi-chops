@@ -612,39 +612,40 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
 
     _freeze_agent_name_allocation(monkeypatch)
 
-    plans = plan_chop_proposals(prepared)
-    assert [plan.clan for plan in plans] == ["toobig-0"] * 3
-    assert [plan.agent_name for plan in plans] == [
-        "toobig-0.large.0",
-        "toobig-0.shared.0",
-        "toobig-0.large.1",
-    ]
-    assert [plan.declares_clan for plan in plans] == [True, False, False]
-    assert [plan.clan_summary for plan in plans] == [authored_summary, None, None]
-    assert sum(plan.prompt.count("%clan(") for plan in plans) == 1
-    assert sum(plan.prompt.count("summary=[[") for plan in plans) == 1
-    assert f"%clan(toobig-0, tribe=chop, summary=[[{authored_summary}]])" in plans[0].prompt
-    assert all("summary=[[" not in plan.prompt for plan in plans[1:])
-    _assert_planned_prompts_use_medium_model([plan.prompt for plan in plans])
+    with override_flags(typed_launch_units=True):
+        plans = plan_chop_proposals(prepared)
+        assert [plan.clan for plan in plans] == ["toobig-0"] * 3
+        assert [plan.agent_name for plan in plans] == [
+            "toobig-0.large.0",
+            "toobig-0.shared.0",
+            "toobig-0.large.1",
+        ]
+        assert [plan.declares_clan for plan in plans] == [True, False, False]
+        assert [plan.clan_summary for plan in plans] == [authored_summary, None, None]
+        assert sum(plan.prompt.count("%clan(") for plan in plans) == 1
+        assert sum(plan.prompt.count("summary=[[") for plan in plans) == 1
+        assert f"%clan(toobig-0, tribe=chop, summary=[[{authored_summary}]])" in plans[0].prompt
+        assert all("summary=[[" not in plan.prompt for plan in plans[1:])
+        _assert_planned_prompts_use_medium_model([plan.prompt for plan in plans])
 
-    parsed = [extract_prompt_directives(plan.prompt)[1] for plan in plans]
-    assert parsed[0].clan_declared
-    assert parsed[0].clan == "toobig-0"
-    assert parsed[0].clan_tribe == "chop"
-    assert parsed[0].clan_summary == authored_summary
-    assert all(not directives.clan_declared for directives in parsed[1:])
-    assert all(directives.clan_summary is None for directives in parsed[1:])
+        parsed = [extract_prompt_directives(plan.prompt)[1] for plan in plans]
+        assert parsed[0].clan_declared
+        assert parsed[0].clan == "toobig-0"
+        assert parsed[0].clan_tribe == "chop"
+        assert parsed[0].clan_summary == authored_summary
+        assert all(not directives.clan_declared for directives in parsed[1:])
+        assert all(directives.clan_summary is None for directives in parsed[1:])
 
-    accepted_tail = [replace(prepared[1], wait_on=None), *prepared[2:]]
-    tail_plans = plan_chop_proposals(accepted_tail)
-    assert [plan.agent_name for plan in tail_plans] == [
-        "toobig-0.shared.0",
-        "toobig-0.large.0",
-    ]
-    assert [plan.declares_clan for plan in tail_plans] == [True, False]
-    assert [plan.clan_summary for plan in tail_plans] == [authored_summary, None]
-    assert extract_prompt_directives(tail_plans[0].prompt)[1].clan_summary == authored_summary
-    _assert_planned_prompts_use_medium_model([plan.prompt for plan in tail_plans])
+        accepted_tail = [replace(prepared[1], wait_on=None), *prepared[2:]]
+        tail_plans = plan_chop_proposals(accepted_tail)
+        assert [plan.agent_name for plan in tail_plans] == [
+            "toobig-0.shared.0",
+            "toobig-0.large.0",
+        ]
+        assert [plan.declares_clan for plan in tail_plans] == [True, False]
+        assert [plan.clan_summary for plan in tail_plans] == [authored_summary, None]
+        assert extract_prompt_directives(tail_plans[0].prompt)[1].clan_summary == authored_summary
+        _assert_planned_prompts_use_medium_model([plan.prompt for plan in tail_plans])
 
 
 def test_custom_tree_limits_and_legacy_env_target_resolution(
@@ -1177,16 +1178,17 @@ def test_sase_bridge_launches_eligible_file_after_admission(
     dispatched: list[str] = []
     authored_summary = result["proposed_launches"][0]["clan_summary"]
     _freeze_agent_name_allocation(monkeypatch)
-    prepared = prepare_chop_proposals("toobig_split", result)
-    plans = plan_chop_proposals(prepared)
-    planned = extract_prompt_directives(plans[0].prompt)[1]
-    assert plans[0].agent_name == "toobig-0.large.0"
-    assert planned.clan == "toobig-0"
-    assert planned.clan_declared is True
-    assert planned.clan_tribe == "chop"
-    assert planned.clan_summary == authored_summary
 
     with override_flags(typed_launch_units=True):
+        prepared = prepare_chop_proposals("toobig_split", result)
+        plans = plan_chop_proposals(prepared)
+        planned = extract_prompt_directives(plans[0].prompt)[1]
+        assert plans[0].agent_name == "toobig-0.large.0"
+        assert planned.clan == "toobig-0"
+        assert planned.clan_declared is True
+        assert planned.clan_tribe == "chop"
+        assert planned.clan_summary == authored_summary
+
         launches = launch_chop_proposals(
             lumberjack_name="maintenance",
             chop_name="toobig_split",
@@ -1197,24 +1199,24 @@ def test_sase_bridge_launches_eligible_file_after_admission(
             launch_agents_from_cwd_fn=_capturing_launcher(dispatched, tmp_path, repo),
         )
 
-    summary = launches.admission_result.summary
-    assert len(launches) == 1
-    assert launches.typed_admission is not None
-    assert launches.admission_result.admission_complete
-    assert summary is not None
-    assert summary.launched == 1
-    assert summary.skipped == 0
-    assert summary.condition_errors == 0
-    assert summary.launch_errors == 0
-    assert len(dispatched) == 1
-    assert "%if" not in dispatched[0]
-    assert "line_count" not in dispatched[0]
-    directives = extract_prompt_directives(dispatched[0])[1]
-    assert directives.name == "toobig-0.large.0"
-    assert "split_file" not in (directives.name or "")
-    assert launches[0]["clan"] == "toobig-0"
-    assert launches[0]["member_id"] == "large.0"
-    assert launches[0]["agent_name"] == directives.name
+        summary = launches.admission_result.summary
+        assert len(launches) == 1
+        assert launches.typed_admission is not None
+        assert launches.admission_result.admission_complete
+        assert summary is not None
+        assert summary.launched == 1
+        assert summary.skipped == 0
+        assert summary.condition_errors == 0
+        assert summary.launch_errors == 0
+        assert len(dispatched) == 1
+        assert "%if" not in dispatched[0]
+        assert "line_count" not in dispatched[0]
+        directives = extract_prompt_directives(dispatched[0])[1]
+        assert directives.name == "toobig-0.large.0"
+        assert "split_file" not in (directives.name or "")
+        assert launches[0]["clan"] == "toobig-0"
+        assert launches[0]["member_id"] == "large.0"
+        assert launches[0]["agent_name"] == directives.name
 
 
 def test_sase_bridge_promotes_next_basename_member_when_first_skips(
@@ -1251,20 +1253,21 @@ def test_sase_bridge_promotes_next_basename_member_when_first_skips(
     )
     dispatched: list[str] = []
     _freeze_agent_name_allocation(monkeypatch)
-    prepared = prepare_chop_proposals("toobig_split", result)
-    plans = plan_chop_proposals(prepared)
-    assert [plan.agent_name for plan in plans] == ["toobig-0.large.0", "toobig-0.shared.0"]
-    assert [plan.declares_clan for plan in plans] == [True, False]
-    tail_plans = plan_chop_proposals([replace(prepared[1], wait_on=None)])
-    tail = extract_prompt_directives(tail_plans[0].prompt)[1]
-    assert tail_plans[0].agent_name == "toobig-0.shared.0"
-    assert tail_plans[0].declares_clan is True
-    assert tail.clan == "toobig-0"
-    assert tail.clan_declared is True
-    assert tail.clan_tribe == "chop"
-    assert tail.clan_summary == authored_summary
 
     with override_flags(typed_launch_units=True):
+        prepared = prepare_chop_proposals("toobig_split", result)
+        plans = plan_chop_proposals(prepared)
+        assert [plan.agent_name for plan in plans] == ["toobig-0.large.0", "toobig-0.shared.0"]
+        assert [plan.declares_clan for plan in plans] == [True, False]
+        tail_plans = plan_chop_proposals([replace(prepared[1], wait_on=None)])
+        tail = extract_prompt_directives(tail_plans[0].prompt)[1]
+        assert tail_plans[0].agent_name == "toobig-0.shared.0"
+        assert tail_plans[0].declares_clan is True
+        assert tail.clan == "toobig-0"
+        assert tail.clan_declared is True
+        assert tail.clan_tribe == "chop"
+        assert tail.clan_summary == authored_summary
+
         launches = launch_chop_proposals(
             lumberjack_name="maintenance",
             chop_name="toobig_split",
@@ -1275,23 +1278,23 @@ def test_sase_bridge_promotes_next_basename_member_when_first_skips(
             launch_agents_from_cwd_fn=_capturing_launcher(dispatched, tmp_path, repo),
         )
 
-    summary = launches.admission_result.summary
-    assert len(launches) == 1
-    assert launches.typed_admission is not None
-    assert launches.admission_result.admission_complete
-    assert summary is not None
-    assert summary.total == 2
-    assert summary.launched == 1
-    assert summary.skipped == 1
-    assert summary.condition_errors == 0
-    assert summary.launch_errors == 0
-    assert len(dispatched) == 1
-    assert "%if" not in dispatched[0]
-    directives = extract_prompt_directives(dispatched[0])[1]
-    assert directives.name is not None
-    assert "shared" in directives.name
-    assert "large" not in directives.name
-    assert "split_file" not in directives.name
-    assert launches[0]["clan"] == "toobig-0"
-    assert launches[0]["member_id"] == "shared.0"
-    assert launches[0]["agent_name"] == directives.name
+        summary = launches.admission_result.summary
+        assert len(launches) == 1
+        assert launches.typed_admission is not None
+        assert launches.admission_result.admission_complete
+        assert summary is not None
+        assert summary.total == 2
+        assert summary.launched == 1
+        assert summary.skipped == 1
+        assert summary.condition_errors == 0
+        assert summary.launch_errors == 0
+        assert len(dispatched) == 1
+        assert "%if" not in dispatched[0]
+        directives = extract_prompt_directives(dispatched[0])[1]
+        assert directives.name is not None
+        assert "shared" in directives.name
+        assert "large" not in directives.name
+        assert "split_file" not in directives.name
+        assert launches[0]["clan"] == "toobig-0"
+        assert launches[0]["member_id"] == "shared.0"
+        assert launches[0]["agent_name"] == directives.name

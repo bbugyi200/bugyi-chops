@@ -30,11 +30,10 @@ Install the published package into the same managed environment as SASE:
 sase plugin install bugyi-chops
 ```
 
-For development against the repository rather than PyPI:
-
-```bash
-sase plugin install bugyi-chops -g
-```
+`-g`/`--git` forces a built VCS snapshot install from this repository instead of the
+published index distribution; it is not a development install. For local development
+against this repository, see [Development and releases](#development-and-releases)
+below.
 
 All scripts require Python 3.12 or newer and `sase>=0.16.0,<0.17`. SASE 0.16.0 is the
 first compatible release series for typed Axe chop admission with `%if`. The package
