@@ -144,10 +144,15 @@ Each proposal has:
 - `wait_on` pointing to the prior file, preserving sequential workspace allocation.
 
 The `%if` fence runs after the proposal's sequential wait and immediately before typed
-admission. It skips without allocating an agent, runner, workspace, or model request
-when the target file is gone or has dropped below the configured floor (`min(limits)`,
-700 lines in the default configuration). A read/count failure for an existing file is a
-visible condition error. This requires SASE's `typed_launch_units` flag and a compatible
+admission. SASE briefly claims a temporary numbered workspace to evaluate it — never a
+runner, agent identity, or model request — and releases that claim once the verdict is
+settled, whether the proposal is eligible or skipped. This is why a queued condition
+still sees a file an earlier agent already split even when the chop's own checkout is
+stale: the leased checkout synchronizes from the configured upstream before `%if` runs.
+The proposal skips when the target file is gone or has dropped below the configured
+floor (`min(limits)`, 700 lines in the default configuration) in that freshly leased
+checkout. A read/count failure for an existing file is a visible condition error. This
+requires SASE's `typed_launch_units` flag and a compatible
 SASE 0.16.x runtime; older SASE 0.13.x runtimes reject these directives before model
 dispatch.
 

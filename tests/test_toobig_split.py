@@ -90,12 +90,12 @@ def _write_lines(path: Path, count: int) -> None:
     path.write_text("x\n" * count, encoding="utf-8")
 
 
-def _known_project_resolver(repo: Path) -> SimpleNamespace:
+def _known_project_resolver(repo: Path, project_file: Path) -> SimpleNamespace:
     return SimpleNamespace(
         workflow_type="git",
         ref="demo",
         workspace_dir=str(repo),
-        project_file=str(repo / "demo.sase"),
+        project_file=str(project_file),
     )
 
 
@@ -230,13 +230,91 @@ def _capturing_launcher(
     return _launch
 
 
+def _seed_tree(base: Path) -> None:
+    (base / "src/pkg").mkdir(parents=True)
+    (base / "tests").mkdir()
+    (base / "src/pkg/large.py").write_text("x = 1\n", encoding="utf-8")
+    (base / "src/pkg/shared.py").write_text("y = 2\n", encoding="utf-8")
+    (base / "tests/large.py").write_text("z = 3\n", encoding="utf-8")
+
+
 def _prepare_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
-    (repo / "src/pkg").mkdir(parents=True)
-    (repo / "tests").mkdir()
-    (repo / "src/pkg/large.py").write_text("x = 1\n", encoding="utf-8")
-    (repo / "src/pkg/shared.py").write_text("y = 2\n", encoding="utf-8")
-    (repo / "tests/large.py").write_text("z = 3\n", encoding="utf-8")
+    _seed_tree(repo)
+    return repo
+
+
+def _run_git(args: list[str], cwd: Path) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _init_git(path: Path) -> None:
+    _run_git(["init", "-q"], path)
+    _run_git(["config", "user.email", "test@test.com"], path)
+    _run_git(["config", "user.name", "Test"], path)
+
+
+def _git_commit_all(repo: Path, message: str) -> None:
+    _run_git(["add", "-A"], repo)
+    _run_git(["commit", "-q", "-m", message], repo)
+
+
+def _write_project_file(path: Path, *, primary: Path) -> Path:
+    path.write_text(
+        "\n".join(
+            [
+                f"WORKSPACE_DIR: {primary}",
+                "",
+                "NAME: demo",
+                "DESCRIPTION:",
+                "  toobig_split condition-workspace lease fixture",
+                "STATUS: Ready",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _leaseable_repo(tmp_path: Path) -> Path:
+    """A real git checkout that a condition-workspace lease can clone."""
+    repo = _prepare_repo(tmp_path)
+    _init_git(repo)
+    _git_commit_all(repo, "initial")
+    _run_git(["branch", "-M", "main"], repo)
+    return repo
+
+
+def _stale_repo_behind_upstream(tmp_path: Path, paths: list[str]) -> Path:
+    """Build the incident topology from the epic plan's evidence.
+
+    A separate ``writer`` checkout pushes the already-split files straight to
+    the configured upstream while ``repo`` -- the chop/source checkout that
+    scans and proposes -- never pulls that push, so it stays stale.
+    """
+    upstream = tmp_path / "upstream.git"
+    _run_git(["init", "-q", "--bare", str(upstream)], tmp_path)
+    _run_git(["symbolic-ref", "HEAD", "refs/heads/main"], upstream)
+
+    writer = tmp_path / "writer"
+    _seed_tree(writer)
+    _init_git(writer)
+    for path in paths:
+        _write_lines(writer / path, 701)
+    _git_commit_all(writer, "oversized")
+    _run_git(["branch", "-M", "main"], writer)
+    _run_git(["remote", "add", "origin", str(upstream)], writer)
+    _run_git(["push", "-qu", "origin", "main"], writer)
+
+    repo = tmp_path / "repo"
+    _run_git(["clone", "-q", str(upstream), str(repo)], tmp_path)
+
+    for path in paths:
+        _write_lines(writer / path, 699)
+    _git_commit_all(writer, "split")
+    _run_git(["push", "-q", "origin", "main"], writer)
+
     return repo
 
 
@@ -1015,10 +1093,8 @@ def test_sase_bridge_skips_stale_queued_files_without_agent_launch(
     run_chop_main: Callable[..., dict[str, Any]],
 ) -> None:
     pytest.importorskip("sase_core_rs")
-    repo = _prepare_repo(tmp_path)
     paths = ["src/pkg/large.py", "src/pkg/shared.py"]
-    for path in paths:
-        _write_lines(repo / path, 701)
+    repo = _stale_repo_behind_upstream(tmp_path, paths)
     scanner = _fake_toobig(tmp_path)
     monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
     monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", "".join(f"{path}\n" for path in paths))
@@ -1029,12 +1105,13 @@ def test_sase_bridge_skips_stale_queued_files_without_agent_launch(
         target=_target(repo),
         variables={"toobig": str(scanner), "trees": ["src"]},
     )
-    for path in paths:
-        _write_lines(repo / path, 699)
     monkeypatch.setenv("SASE_HOME", str(tmp_path / ".sase"))
+    monkeypatch.setenv("SASE_WORKSPACE_ROOT", str(tmp_path / "workspace_pool"))
+    monkeypatch.setenv("SASE_PYTEST_SANDBOX_DIR", str(tmp_path))
+    project_file = _write_project_file(tmp_path / "demo.sase", primary=repo)
     monkeypatch.setattr(
         "sase.agent.launch_cwd_common.resolve_known_project_vcs_launch_ref",
-        lambda _prompt: _known_project_resolver(repo),
+        lambda _prompt: _known_project_resolver(repo, project_file),
     )
 
     def _unexpected_launch(*_args: object, **_kwargs: object) -> list[object]:
@@ -1061,6 +1138,13 @@ def test_sase_bridge_skips_stale_queued_files_without_agent_launch(
     assert summary.condition_errors == 0
     assert summary.launch_errors == 0
 
+    # The leased checkout synchronized the newer upstream split even though
+    # the chop's own primary checkout (`repo`) never pulled it.
+    leased_large_files = sorted((tmp_path / "workspace_pool").rglob("large.py"))
+    assert leased_large_files
+    assert _line_count(leased_large_files[0]) == 699
+    assert _line_count(repo / "src/pkg/large.py") == 701
+
 
 def test_sase_bridge_launches_eligible_file_after_admission(
     tmp_path: Path,
@@ -1068,9 +1152,10 @@ def test_sase_bridge_launches_eligible_file_after_admission(
     run_chop_main: Callable[..., dict[str, Any]],
 ) -> None:
     pytest.importorskip("sase_core_rs")
-    repo = _prepare_repo(tmp_path)
+    repo = _leaseable_repo(tmp_path)
     path = "src/pkg/large.py"
     _write_lines(repo / path, 700)
+    _git_commit_all(repo, "large enough")
     scanner = _fake_toobig(tmp_path)
     monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
     monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", f"{path}\n")
@@ -1082,9 +1167,12 @@ def test_sase_bridge_launches_eligible_file_after_admission(
         variables={"toobig": str(scanner), "trees": ["src"]},
     )
     monkeypatch.setenv("SASE_HOME", str(tmp_path / ".sase"))
+    monkeypatch.setenv("SASE_WORKSPACE_ROOT", str(tmp_path / "workspace_pool"))
+    monkeypatch.setenv("SASE_PYTEST_SANDBOX_DIR", str(tmp_path))
+    project_file = _write_project_file(tmp_path / "demo.sase", primary=repo)
     monkeypatch.setattr(
         "sase.agent.launch_cwd_common.resolve_known_project_vcs_launch_ref",
-        lambda _prompt: _known_project_resolver(repo),
+        lambda _prompt: _known_project_resolver(repo, project_file),
     )
     dispatched: list[str] = []
     authored_summary = result["proposed_launches"][0]["clan_summary"]
@@ -1135,10 +1223,11 @@ def test_sase_bridge_promotes_next_basename_member_when_first_skips(
     run_chop_main: Callable[..., dict[str, Any]],
 ) -> None:
     pytest.importorskip("sase_core_rs")
-    repo = _prepare_repo(tmp_path)
+    repo = _leaseable_repo(tmp_path)
     paths = ["src/pkg/large.py", "src/pkg/shared.py"]
     for path in paths:
         _write_lines(repo / path, 701)
+    _git_commit_all(repo, "oversized")
     scanner = _fake_toobig(tmp_path)
     monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
     monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", "".join(f"{path}\n" for path in paths))
@@ -1151,10 +1240,14 @@ def test_sase_bridge_promotes_next_basename_member_when_first_skips(
     )
     authored_summary = result["proposed_launches"][0]["clan_summary"]
     _write_lines(repo / paths[0], 699)
+    _git_commit_all(repo, "split large")
     monkeypatch.setenv("SASE_HOME", str(tmp_path / ".sase"))
+    monkeypatch.setenv("SASE_WORKSPACE_ROOT", str(tmp_path / "workspace_pool"))
+    monkeypatch.setenv("SASE_PYTEST_SANDBOX_DIR", str(tmp_path))
+    project_file = _write_project_file(tmp_path / "demo.sase", primary=repo)
     monkeypatch.setattr(
         "sase.agent.launch_cwd_common.resolve_known_project_vcs_launch_ref",
-        lambda _prompt: _known_project_resolver(repo),
+        lambda _prompt: _known_project_resolver(repo, project_file),
     )
     dispatched: list[str] = []
     _freeze_agent_name_allocation(monkeypatch)
