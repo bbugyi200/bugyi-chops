@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bugyi-chops"
-version = "0.7.0"
+version = "0.8.0"
 description = "Personal SASE axe chops for notifications, releases, and maintenance proposals"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -98,6 +98,23 @@ def _commit(
     }
 
 
+def _run(
+    name: str,
+    *,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    created_at: str = "2026-08-21T10:00:00Z",
+    updated_at: str = "2026-08-21T10:05:00Z",
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
 def _failure_job(
     name: str = "test token=do-not-leak",
     *,
@@ -122,6 +139,8 @@ def _head_evidence(
     green: bool = False,
     failing_jobs: Sequence[FailingJobEvidence] = (),
     successful_jobs: Sequence[str] = (),
+    observed_workflows: Sequence[str] = (),
+    in_flight_workflows: Sequence[str] = (),
 ) -> HeadCiEvidence:
     return HeadCiEvidence(
         sha=sha,
@@ -129,6 +148,8 @@ def _head_evidence(
         all_completed_green=green,
         failing_jobs=tuple(failing_jobs),
         successful_jobs=tuple(successful_jobs),
+        observed_workflows=tuple(observed_workflows),
+        in_flight_workflows=tuple(in_flight_workflows),
     )
 
 
@@ -206,7 +227,12 @@ class FakeGitHub:
         self.head_evidence_calls: list[tuple[str, str]] = []
         self.numbers: dict[str, list[int] | Exception] = {REPO: [], CORE: [], TELEGRAM: []}
         self.prs: dict[tuple[str, int], list[ReleasePr]] = {}
-        self.busy: set[str] = set()
+        self.branch_runs: dict[str, list[dict[str, Any]] | Exception] = {
+            REPO: [],
+            CORE: [],
+            TELEGRAM: [],
+        }
+        self.branch_run_calls: list[tuple[str, str]] = []
         self.merge_results: list[CommandResult] = []
         self.merges: list[MergePlan] = []
 
@@ -229,9 +255,13 @@ class FakeGitHub:
             raise value
         return value
 
-    def generator_busy(self, repo: str, branch: str) -> bool:
+    def workflow_runs(self, repo: str, branch: str) -> list[dict[str, Any]]:
         assert branch == "master"
-        return repo in self.busy
+        self.branch_run_calls.append((repo, branch))
+        value = self.branch_runs[repo]
+        if isinstance(value, Exception):
+            raise value
+        return list(value)
 
     def release_pr_numbers(self, repo: str) -> list[int]:
         value = self.numbers[repo]
@@ -785,6 +815,347 @@ def test_live_merge_reread_and_command_failures_fail_closed(
     assert ledger["repositories"][REPO]["merge_error"] == "head conflict"
 
 
+def test_empty_gate_allowlists_preserve_default_branch_green_requirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    github = FakeGitHub()
+    github.numbers[REPO] = [10]
+    github.prs[(REPO, 10)] = [_pr()]
+
+    result, ledger, github, _ = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        github=github,
+        variables=_vars(releases=(REPO,), merge_enabled=True),
+        clock=_clock_at(),
+    )
+
+    assert result["counters"]["merged"] == 0
+    assert ledger["repositories"][REPO]["release_reason"] == "default_branch_not_green"
+    assert github.merges == []
+    assert github.head_evidence_calls == []
+
+
+def test_gating_workflows_gate_release_independent_of_actstat_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    variables = _vars(releases=(REPO,), merge_enabled=True)
+    variables["gating_workflows"] = ["Fast"]
+
+    green_gate = FakeGitHub()
+    green_gate.numbers[REPO] = [10]
+    green_gate.prs[(REPO, 10)] = [_pr()]
+    green_gate.head_evidence[REPO] = _head_evidence(SHA, observed_workflows=("Fast",))
+    result, ledger, green_gate, _ = _build(
+        tmp_path / "red-actstat-green-gate",
+        _observations(red=(REPO,)),
+        github=green_gate,
+        variables=variables,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["merged"] == 1
+    assert ledger["repositories"][REPO]["release_reason"] == "merged"
+    assert (REPO, SHA) in green_gate.head_evidence_calls
+
+    missing = FakeGitHub()
+    missing.numbers[REPO] = [10]
+    missing.prs[(REPO, 10)] = [_pr()]
+    missing.head_evidence[REPO] = _head_evidence(SHA, observed_workflows=("Other",))
+    result, ledger, _, _ = _build(
+        tmp_path / "missing",
+        _observations(),
+        github=missing,
+        variables=variables,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["merged"] == 0
+    assert result["counters"]["merge_skipped"] == 1
+    assert ledger["repositories"][REPO]["release_reason"] == "gating_workflow_missing"
+
+    in_flight = FakeGitHub()
+    in_flight.numbers[REPO] = [10]
+    in_flight.prs[(REPO, 10)] = [_pr()]
+    in_flight.head_evidence[REPO] = _head_evidence(
+        SHA, observed_workflows=("Fast",), in_flight_workflows=("Fast",)
+    )
+    result, ledger, _, _ = _build(
+        tmp_path / "in-flight",
+        _observations(),
+        github=in_flight,
+        variables=variables,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["merged"] == 0
+    assert ledger["repositories"][REPO]["release_reason"] == "gating_workflow_in_flight"
+
+    red_gate = FakeGitHub()
+    red_gate.numbers[REPO] = [10]
+    red_gate.prs[(REPO, 10)] = [_pr()]
+    red_gate.head_evidence[REPO] = _head_evidence(
+        SHA,
+        observed_workflows=("Fast",),
+        failing_jobs=(_failure_job("lint", workflow="Fast"),),
+    )
+    result, ledger, _, _ = _build(
+        tmp_path / "red-gate",
+        _observations(),
+        github=red_gate,
+        variables=variables,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["merged"] == 0
+    assert ledger["repositories"][REPO]["release_reason"] == "gating_workflow_red"
+
+
+def test_heavy_lane_requires_a_recent_green_run_and_reuses_one_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    variables = _vars(releases=(REPO,), merge_enabled=True)
+    variables["heavy_workflows"] = ["E2E"]
+    variables["heavy_max_age_hours"] = 6
+
+    fresh = FakeGitHub()
+    fresh.numbers[REPO] = [10]
+    fresh.prs[(REPO, 10)] = [_pr()]
+    fresh.branch_runs[REPO] = [
+        _run("E2E", created_at="2026-08-21T14:00:00Z", updated_at="2026-08-21T15:00:00Z")
+    ]
+    result, ledger, fresh, _ = _build(
+        tmp_path / "fresh",
+        _observations(),
+        github=fresh,
+        variables=variables,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["merged"] == 1
+    assert ledger["repositories"][REPO]["release_reason"] == "merged"
+    # One branch-run query drives both the generator-busy and heavy-lane checks per
+    # decision: the initial plan and the pre-merge reread.
+    assert fresh.branch_run_calls == [(REPO, "master"), (REPO, "master")]
+
+    stale = FakeGitHub()
+    stale.numbers[REPO] = [10]
+    stale.prs[(REPO, 10)] = [_pr()]
+    stale.branch_runs[REPO] = [
+        _run("E2E", created_at="2026-08-21T08:00:00Z", updated_at="2026-08-21T08:00:00Z")
+    ]
+    result, ledger, _, _ = _build(
+        tmp_path / "stale",
+        _observations(),
+        github=stale,
+        variables=variables,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["merged"] == 0
+    assert ledger["repositories"][REPO]["release_reason"] == "heavy_lane_stale"
+
+    missing = FakeGitHub()
+    missing.numbers[REPO] = [10]
+    missing.prs[(REPO, 10)] = [_pr()]
+    result, ledger, _, _ = _build(
+        tmp_path / "missing",
+        _observations(),
+        github=missing,
+        variables=variables,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["merged"] == 0
+    assert ledger["repositories"][REPO]["release_reason"] == "heavy_lane_not_green"
+
+    red = FakeGitHub()
+    red.numbers[REPO] = [10]
+    red.prs[(REPO, 10)] = [_pr()]
+    red.branch_runs[REPO] = [
+        _run(
+            "E2E",
+            conclusion="failure",
+            created_at="2026-08-21T14:00:00Z",
+            updated_at="2026-08-21T15:00:00Z",
+        )
+    ]
+    result, ledger, _, _ = _build(
+        tmp_path / "red",
+        _observations(),
+        github=red,
+        variables=variables,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["merged"] == 0
+    assert ledger["repositories"][REPO]["release_reason"] == "heavy_lane_not_green"
+
+
+@pytest.mark.parametrize(
+    ("merge_method", "flag"),
+    [("merge", "--merge"), ("squash", "--squash"), ("rebase", "--rebase")],
+)
+def test_configured_merge_method_threads_through_plan_and_gh_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    merge_method: str,
+    flag: str,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    github = FakeGitHub()
+    github.numbers[REPO] = [10]
+    github.prs[(REPO, 10)] = [_pr()]
+    variables = _vars(releases=(REPO,), merge_enabled=True)
+    variables["merge_method"] = merge_method
+
+    result, _, github, _ = _build(
+        tmp_path,
+        _observations(),
+        github=github,
+        variables=variables,
+        clock=_clock_at(),
+    )
+
+    assert result["counters"]["merged"] == 1
+    assert len(github.merges) == 1
+    assert github.merges[0].merge_method == merge_method
+    state = _state(tmp_path)
+    assert state["releases"][0]["outcome"] == f"{merge_method}_merge_submitted"
+
+    runner = QueueRunner(CommandResult(0))
+    real_github = GitHubReader("/gh", runner)
+    pr = _pr()
+    assert real_github.merge(MergePlan(REPO, pr, merge_method)).returncode == 0
+    assert runner.calls[-1][0] == [
+        "/gh",
+        "pr",
+        "merge",
+        str(pr.number),
+        "--repo",
+        REPO,
+        flag,
+        "--match-head-commit",
+        pr.head_oid,
+    ]
+
+
+def test_release_gate_reason_distinguishes_missing_in_flight_and_red() -> None:
+    missing = _head_evidence(SHA, observed_workflows=("CI",))
+    assert (
+        ci_watch_module._release_gate_reason(missing, ("CI", "Fast")) == "gating_workflow_missing"
+    )
+
+    in_flight = _head_evidence(
+        SHA, observed_workflows=("CI", "Fast"), in_flight_workflows=("Fast",)
+    )
+    assert (
+        ci_watch_module._release_gate_reason(in_flight, ("CI", "Fast"))
+        == "gating_workflow_in_flight"
+    )
+
+    red = _head_evidence(
+        SHA,
+        observed_workflows=("CI", "Fast"),
+        failing_jobs=(_failure_job("lint", workflow="Fast"),),
+    )
+    assert ci_watch_module._release_gate_reason(red, ("CI", "Fast")) == "gating_workflow_red"
+
+    clean = _head_evidence(SHA, observed_workflows=("CI", "Fast"))
+    assert ci_watch_module._release_gate_reason(clean, ("CI", "Fast")) is None
+    assert ci_watch_module._release_gate_reason(clean, ()) is None
+
+
+def test_evaluate_heavy_lane_freshness_and_conclusion_gates() -> None:
+    now = FIXED_NOW
+    fresh_green = [_run("E2E", updated_at="2026-08-21T15:00:00Z")]
+    assert ci_watch_module._evaluate_heavy_lane(REPO, fresh_green, ("E2E",), 6, now) is None
+
+    stale_green = [_run("E2E", updated_at="2026-08-21T08:00:00Z")]
+    assert (
+        ci_watch_module._evaluate_heavy_lane(REPO, stale_green, ("E2E",), 6, now)
+        == "heavy_lane_stale"
+    )
+
+    red = [_run("E2E", conclusion="failure", updated_at="2026-08-21T15:00:00Z")]
+    assert (
+        ci_watch_module._evaluate_heavy_lane(REPO, red, ("E2E",), 6, now) == "heavy_lane_not_green"
+    )
+
+    assert (
+        ci_watch_module._evaluate_heavy_lane(REPO, [], ("E2E",), 6, now) == "heavy_lane_not_green"
+    )
+
+    mixed = [
+        _run(
+            "E2E",
+            conclusion="failure",
+            created_at="2026-08-21T09:00:00Z",
+            updated_at="2026-08-21T09:05:00Z",
+        ),
+        _run("E2E", created_at="2026-08-21T14:00:00Z", updated_at="2026-08-21T15:30:00Z"),
+        {
+            "name": "E2E",
+            "status": "in_progress",
+            "conclusion": None,
+            "created_at": "2026-08-21T15:50:00Z",
+        },
+    ]
+    assert ci_watch_module._evaluate_heavy_lane(REPO, mixed, ("E2E",), 6, now) is None
+
+    with pytest.raises(CiWatchError, match="missing or invalid 'updated_at'"):
+        ci_watch_module._evaluate_heavy_lane(
+            REPO,
+            [{"name": "E2E", "status": "completed", "conclusion": "success"}],
+            ("E2E",),
+            6,
+            now,
+        )
+
+    with pytest.raises(CiWatchError, match="invalid completion timestamp"):
+        ci_watch_module._evaluate_heavy_lane(
+            REPO,
+            [_run("E2E", updated_at="not-a-timestamp")],
+            ("E2E",),
+            6,
+            now,
+        )
+
+
+def test_release_gate_config_validation_and_defaults(tmp_path: Path) -> None:
+    with pytest.raises(CiWatchError, match="merge_method must be one of"):
+        Config.from_invocation(_invocation(tmp_path, {**_vars(), "merge_method": "fast-forward"}))
+    with pytest.raises(CiWatchError, match="gating_workflows must be a list"):
+        Config.from_invocation(_invocation(tmp_path, {**_vars(), "gating_workflows": "CI"}))
+    with pytest.raises(CiWatchError, match="heavy_workflows must be a list"):
+        Config.from_invocation(_invocation(tmp_path, {**_vars(), "heavy_workflows": [1]}))
+    with pytest.raises(CiWatchError, match="heavy_max_age_hours must be a positive number"):
+        Config.from_invocation(_invocation(tmp_path, {**_vars(), "heavy_max_age_hours": 0}))
+    with pytest.raises(CiWatchError, match="heavy_max_age_hours must be a positive number"):
+        Config.from_invocation(_invocation(tmp_path, {**_vars(), "heavy_max_age_hours": True}))
+
+    defaults = Config.from_invocation(_invocation(tmp_path, _vars()))
+    assert defaults.merge_method == "merge"
+    assert defaults.gating_workflows == ()
+    assert defaults.heavy_workflows == ()
+    assert defaults.heavy_max_age_hours == 6.0
+
+    configured = Config.from_invocation(
+        _invocation(
+            tmp_path,
+            {
+                **_vars(),
+                "merge_method": "rebase",
+                "gating_workflows": ["CI", "Lint"],
+                "heavy_workflows": ["E2E"],
+                "heavy_max_age_hours": 12,
+            },
+        )
+    )
+    assert configured.merge_method == "rebase"
+    assert configured.gating_workflows == ("CI", "Lint")
+    assert configured.heavy_workflows == ("E2E",)
+    assert configured.heavy_max_age_hours == 12.0
+
+
 def test_release_notification_retry_and_legacy_migration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1160,9 +1531,12 @@ def test_notification_note_overflow_and_state_helpers() -> None:
         FIXED_NOW,
     )
     assert state["failures"][REPO]["notification_sent"] is False
-    ci_watch_module._append_release_record(state, REPO, _pr(), FIXED_NOW)
-    ci_watch_module._append_release_record(state, REPO, _pr(), FIXED_NOW + timedelta(minutes=1))
+    ci_watch_module._append_release_record(state, REPO, _pr(), FIXED_NOW, "squash")
+    ci_watch_module._append_release_record(
+        state, REPO, _pr(), FIXED_NOW + timedelta(minutes=1), "rebase"
+    )
     assert len(state["releases"]) == 1
+    assert state["releases"][0]["outcome"] == "rebase_merge_submitted"
 
 
 class QueueRunner:
@@ -1266,7 +1640,7 @@ def test_github_reader_queries_release_prs_merges_and_detects_generator_busy() -
         "10",
         "--repo",
         REPO,
-        "--squash",
+        "--merge",
         "--match-head-commit",
         SHA,
     ]
@@ -1529,7 +1903,7 @@ def test_release_observation_errors_detail_cap_and_generator_error(
     monkeypatch.setattr(ci_watch_module, "MAX_RELEASE_PR_DETAILS", 8)
 
     class BrokenGeneratorGitHub(FakeGitHub):
-        def generator_busy(self, repo: str, branch: str) -> bool:
+        def workflow_runs(self, repo: str, branch: str) -> list[dict[str, Any]]:
             del repo, branch
             raise CiWatchError("workflow query failed")
 

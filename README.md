@@ -6,7 +6,7 @@ propose maintenance work. It supplies two console scripts:
 
 | Script | Responsibility |
 | --- | --- |
-| `bugyi_chop_ci_watch` | Notify on CI failures and squash-merge explicitly enabled, guarded release-please PRs |
+| `bugyi_chop_ci_watch` | Notify on CI failures and merge explicitly enabled, guarded release-please PRs |
 | `bugyi_chop_toobig_split` | One sequential condition-gated `%auto #split_file:<path>` agent per oversized Python file, routed through `@medium` |
 
 The scripts never launch agents themselves. `bugyi_chop_toobig_split` scans and
@@ -17,10 +17,10 @@ for those proposals.
 
 `bugyi_chop_ci_watch` is deliberately narrower. It never creates gates, launch
 requests, repair prompts, or Axe proposals. Its only mutation outside its own state and
-report files is a guarded `gh pr merge --squash --match-head-commit` for an eligible
-release-please PR when `vars.merge_enabled` is true and `SASE_CHOP_DRY_RUN=0` is
-explicitly present. Missing or true dry-run context suppresses merging and
-notifications.
+report files is a guarded `gh pr merge --merge|--squash|--rebase --match-head-commit`
+(the flag follows `vars.merge_method`, default `merge`) for an eligible release-please
+PR when `vars.merge_enabled` is true and `SASE_CHOP_DRY_RUN=0` is explicitly present.
+Missing or true dry-run context suppresses merging and notifications.
 
 ## Installation
 
@@ -89,10 +89,25 @@ Release handling is release-please only. Configure `vars.release_repositories` a
 list of repositories from `vars.repos`; generator mappings are rejected and other
 release branch families are ignored. A release PR is mergeable only when all guards
 pass: exactly one release-please candidate for the repository, configured default base, non-draft,
-mergeable and clean, non-empty fully green check rollup, green current default branch,
+mergeable and clean, non-empty fully green check rollup, a green current default branch,
 idle release-please/publish workflow, deterministic dependency order,
 `max_merges_per_tick`, explicit live mode, a final PR/default-branch reread, and
 `--match-head-commit` race protection.
+
+By default "a green current default branch" means the actstat sweep classified it green.
+Configuring `vars.gating_workflows` (a list of workflow names, empty by default) switches
+that guard to explicit HEAD evidence instead: every named workflow must have a completed,
+green run at the exact current default-branch HEAD, distinguishing a workflow that never
+ran (`gating_workflow_missing`), is still running (`gating_workflow_in_flight`), and ran
+red (`gating_workflow_red`). This makes release eligibility independent of the broader
+actstat classification, so unrelated flaky or red workflows outside the allowlist no
+longer block a release. Configuring `vars.heavy_workflows` (also empty by default) adds a
+freshness requirement on top: every named heavy workflow's newest completed run on the
+default branch must be green and no older than `vars.heavy_max_age_hours` (default `6`),
+reported as `heavy_lane_not_green` or `heavy_lane_stale` otherwise. Both allowlists are
+re-checked, from a freshly fetched HEAD, during the final pre-merge reread. Leaving both
+lists empty preserves the pre-existing actstat-only behavior. `vars.merge_method`
+(`merge`, `squash`, or `rebase`; default `merge`) selects the `gh pr merge` flag.
 
 Successful merge submissions are written durably with `notification_sent: false` before
 any SASE notification is attempted. The release notification is marked delivered only
@@ -113,6 +128,17 @@ vars:
   merge_order: [sase-telegram, sase]
   max_merges_per_tick: 1
   merge_enabled: true
+```
+
+Configuration adding an explicit merge method and release gates:
+
+```yaml
+vars:
+  # ... same as above ...
+  merge_method: squash
+  gating_workflows: [CI]
+  heavy_workflows: [E2E]
+  heavy_max_age_hours: 6
 ```
 
 ## `toobig_split`
