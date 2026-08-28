@@ -26,6 +26,7 @@ from bugyi_chops.ci_watch import (
     HeadCiEvidence,
     MergePlan,
     ReleasePr,
+    ReleaseSettings,
     RepoObservation,
     RepoState,
     SaseNotifier,
@@ -235,6 +236,12 @@ class FakeGitHub:
         self.branch_run_calls: list[tuple[str, str]] = []
         self.merge_results: list[CommandResult] = []
         self.merges: list[MergePlan] = []
+        self.allowed_merge_methods: dict[str, set[str] | Exception] = {
+            REPO: {"merge", "squash", "rebase"},
+            CORE: {"merge", "squash", "rebase"},
+            TELEGRAM: {"merge", "squash", "rebase"},
+        }
+        self.merge_method_allowed_calls: list[tuple[str, str]] = []
 
     def default_branch_head(self, repo: str) -> BranchHead:
         value = self.heads[repo]
@@ -276,6 +283,13 @@ class FakeGitHub:
     def merge(self, plan: MergePlan) -> CommandResult:
         self.merges.append(plan)
         return self.merge_results.pop(0) if self.merge_results else CommandResult(0)
+
+    def merge_method_allowed(self, repo: str, merge_method: str) -> bool:
+        self.merge_method_allowed_calls.append((repo, merge_method))
+        value = self.allowed_merge_methods[repo]
+        if isinstance(value, Exception):
+            raise value
+        return merge_method in value
 
 
 class FakeNotifier:
@@ -729,6 +743,75 @@ def test_release_please_live_merge_uses_dependency_order_cap_and_notification(
     assert state["releases"][0]["notification_sent"] is True
 
 
+def test_one_tick_uses_per_repository_release_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    github = FakeGitHub()
+    github.numbers[REPO] = [10]
+    github.numbers[TELEGRAM] = [20]
+    github.prs[(REPO, 10)] = [_pr()]
+    github.prs[(TELEGRAM, 20)] = [_pr(20, repo=TELEGRAM)]
+    github.head_evidence[REPO] = _head_evidence(SHA, observed_workflows=("Master Gate",))
+    github.head_evidence[TELEGRAM] = _head_evidence(
+        TELEGRAM_SHA, observed_workflows=("Plugin Gate",)
+    )
+    github.branch_runs[REPO] = [
+        _run(
+            "Full CI",
+            created_at="2026-08-21T14:00:00Z",
+            updated_at="2026-08-21T15:00:00Z",
+        )
+    ]
+    github.branch_runs[TELEGRAM] = [
+        _run(
+            "Smoke",
+            created_at="2026-08-21T15:00:00Z",
+            updated_at="2026-08-21T15:30:00Z",
+        )
+    ]
+    variables = _vars(
+        releases=(REPO, TELEGRAM),
+        merge_order=("sase-telegram", "sase"),
+        merge_enabled=True,
+        max_merges=2,
+    )
+    variables.update(
+        {
+            "merge_method": {REPO: "merge", TELEGRAM: "squash"},
+            "gating_workflows": {REPO: ["Master Gate"], TELEGRAM: ["Plugin Gate"]},
+            "heavy_workflows": {REPO: ["Full CI"], TELEGRAM: ["Smoke"]},
+            "heavy_max_age_hours": {REPO: 6, TELEGRAM: 1},
+        }
+    )
+
+    result, ledger, github, _ = _build(
+        tmp_path,
+        _observations(),
+        github=github,
+        variables=variables,
+        clock=_clock_at(),
+    )
+
+    assert result["counters"]["merged"] == 2
+    assert [(plan.repo, plan.merge_method) for plan in github.merges] == [
+        (TELEGRAM, "squash"),
+        (REPO, "merge"),
+    ]
+    assert github.merge_method_allowed_calls == [(TELEGRAM, "squash"), (REPO, "merge")]
+    assert set(github.head_evidence_calls) == {(REPO, SHA), (TELEGRAM, TELEGRAM_SHA)}
+    assert ledger["release_plans"] == [
+        {"repo": TELEGRAM, "number": 20, "head_oid": TELEGRAM_SHA, "merge_method": "squash"},
+        {"repo": REPO, "number": 10, "head_oid": SHA, "merge_method": "merge"},
+    ]
+    state = _state(tmp_path)
+    assert [row["outcome"] for row in state["releases"]] == [
+        "squash_merge_submitted",
+        "merge_merge_submitted",
+    ]
+
+
 def test_simultaneous_merge_and_failure_send_both_notification_classes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -813,6 +896,32 @@ def test_live_merge_reread_and_command_failures_fail_closed(
     assert len(failed.merges) == 1
     assert ledger["repositories"][REPO]["reason"] == "merge_failed"
     assert ledger["repositories"][REPO]["merge_error"] == "head conflict"
+
+
+def test_disallowed_repository_merge_method_skips_without_merge_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    github = FakeGitHub()
+    github.numbers[REPO] = [10]
+    github.prs[(REPO, 10)] = [_pr()]
+    github.allowed_merge_methods[REPO] = {"merge"}
+    variables = _vars(releases=(REPO,), merge_enabled=True)
+    variables["merge_method"] = "squash"
+
+    result, ledger, github, _ = _build(
+        tmp_path,
+        _observations(),
+        github=github,
+        variables=variables,
+    )
+
+    assert result["counters"]["merged"] == 0
+    assert result["counters"]["merge_skipped"] == 1
+    assert github.merge_method_allowed_calls == [(REPO, "squash")]
+    assert github.merges == []
+    assert ledger["repositories"][REPO]["release_reason"] == "merge_method_not_allowed"
 
 
 def test_empty_gate_allowlists_preserve_default_branch_green_requirement(
@@ -1154,6 +1263,108 @@ def test_release_gate_config_validation_and_defaults(tmp_path: Path) -> None:
     assert configured.gating_workflows == ("CI", "Lint")
     assert configured.heavy_workflows == ("E2E",)
     assert configured.heavy_max_age_hours == 12.0
+
+
+def test_flat_release_settings_apply_to_every_release_repository(tmp_path: Path) -> None:
+    variables = _vars(releases=(REPO, TELEGRAM))
+    variables.update(
+        {
+            "merge_method": "squash",
+            "gating_workflows": ["CI", "Lint"],
+            "heavy_workflows": ["E2E"],
+            "heavy_max_age_hours": 12,
+        }
+    )
+
+    config = Config.from_invocation(_invocation(tmp_path, variables))
+
+    expected = ReleaseSettings(
+        merge_method="squash",
+        gating_workflows=("CI", "Lint"),
+        heavy_workflows=("E2E",),
+        heavy_max_age_hours=12.0,
+    )
+    assert config.default_release_settings == expected
+    assert config.merge_method == "squash"
+    assert config.gating_workflows == ("CI", "Lint")
+    assert config.heavy_workflows == ("E2E",)
+    assert config.heavy_max_age_hours == 12.0
+    assert config.release_settings_for(REPO) == expected
+    assert config.release_settings_for(TELEGRAM) == expected
+
+
+def test_mapped_release_settings_precedence_and_builtin_fallback(tmp_path: Path) -> None:
+    variables = _vars(releases=(REPO, CORE, TELEGRAM))
+    variables.update(
+        {
+            "merge_method": {"default": "squash", REPO: "rebase"},
+            "gating_workflows": {REPO: ["Master Gate"]},
+            "heavy_workflows": {"default": ["Full CI"], TELEGRAM: []},
+            "heavy_max_age_hours": {TELEGRAM: 12},
+        }
+    )
+
+    config = Config.from_invocation(_invocation(tmp_path, variables))
+
+    assert config.default_release_settings == ReleaseSettings(
+        merge_method="squash",
+        gating_workflows=(),
+        heavy_workflows=("Full CI",),
+        heavy_max_age_hours=6.0,
+    )
+    assert config.release_settings_for(REPO) == ReleaseSettings(
+        merge_method="rebase",
+        gating_workflows=("Master Gate",),
+        heavy_workflows=("Full CI",),
+        heavy_max_age_hours=6.0,
+    )
+    assert config.release_settings_for(CORE) == ReleaseSettings(
+        merge_method="squash",
+        gating_workflows=(),
+        heavy_workflows=("Full CI",),
+        heavy_max_age_hours=6.0,
+    )
+    assert config.release_settings_for(TELEGRAM) == ReleaseSettings(
+        merge_method="squash",
+        gating_workflows=(),
+        heavy_workflows=(),
+        heavy_max_age_hours=12.0,
+    )
+
+
+def test_mapped_release_settings_reject_unknown_keys_and_bad_values(tmp_path: Path) -> None:
+    with pytest.raises(CiWatchError, match="mapping keys must be repository strings"):
+        Config.from_invocation(
+            _invocation(tmp_path, {**_vars(releases=(REPO,)), "merge_method": {1: "merge"}})
+        )
+    with pytest.raises(CiWatchError, match="unknown release repository"):
+        Config.from_invocation(
+            _invocation(
+                tmp_path,
+                {**_vars(releases=(REPO,)), "merge_method": {CORE: "merge"}},
+            )
+        )
+    with pytest.raises(CiWatchError, match="merge_method.*must be one of"):
+        Config.from_invocation(
+            _invocation(
+                tmp_path,
+                {**_vars(releases=(REPO,)), "merge_method": {REPO: "fast-forward"}},
+            )
+        )
+    with pytest.raises(CiWatchError, match="gating_workflows.*must be a list"):
+        Config.from_invocation(
+            _invocation(
+                tmp_path,
+                {**_vars(releases=(REPO,)), "gating_workflows": {REPO: "CI"}},
+            )
+        )
+    with pytest.raises(CiWatchError, match="heavy_max_age_hours.*must be a positive number"):
+        Config.from_invocation(
+            _invocation(
+                tmp_path,
+                {**_vars(releases=(REPO,)), "heavy_max_age_hours": {REPO: True}},
+            )
+        )
 
 
 def test_release_notification_retry_and_legacy_migration(
@@ -1593,6 +1804,12 @@ def test_actstat_client_parses_rows_filters_scope_and_rejects_bad_input() -> Non
 
 
 def test_github_reader_queries_release_prs_merges_and_detects_generator_busy() -> None:
+    metadata = {
+        "default_branch": "master",
+        "allow_merge_commit": True,
+        "allow_squash_merge": True,
+        "allow_rebase_merge": False,
+    }
     pr_json = {
         "number": 10,
         "isDraft": False,
@@ -1607,7 +1824,7 @@ def test_github_reader_queries_release_prs_merges_and_detects_generator_busy() -
         "createdAt": "2026-08-21T10:00:00Z",
     }
     runner = QueueRunner(
-        CommandResult(0, '{"default_branch":"master"}'),
+        CommandResult(0, json.dumps(metadata)),
         CommandResult(0, json.dumps({"sha": SHA})),
         CommandResult(
             0,
@@ -1628,6 +1845,9 @@ def test_github_reader_queries_release_prs_merges_and_detects_generator_busy() -
     )
     github = GitHubReader("/gh", runner)
     assert github.default_branch_head(REPO) == BranchHead("master", SHA)
+    assert github.merge_method_allowed(REPO, "squash")
+    assert not github.merge_method_allowed(REPO, "rebase")
+    assert [call[0] for call in runner.calls].count(["/gh", "api", f"repos/{REPO}"]) == 1
     assert github.generator_busy(REPO, "master")
     assert github.release_pr_numbers(REPO) == [10]
     pr = github.release_pr(REPO, 10)
@@ -1644,6 +1864,27 @@ def test_github_reader_queries_release_prs_merges_and_detects_generator_busy() -
         "--match-head-commit",
         SHA,
     ]
+
+
+def test_github_reader_parses_allowed_merge_metadata_without_default_head_query() -> None:
+    runner = QueueRunner(
+        CommandResult(
+            0,
+            json.dumps(
+                {
+                    "default_branch": "main",
+                    "allow_merge_commit": False,
+                    "allow_squash_merge": True,
+                    "allow_rebase_merge": False,
+                }
+            ),
+        )
+    )
+    github = GitHubReader("/gh", runner)
+
+    assert github.merge_method_allowed(REPO, "squash")
+    assert not github.merge_method_allowed(REPO, "merge")
+    assert runner.calls == [(["/gh", "api", f"repos/{REPO}"], None, None)]
 
 
 def test_github_reader_bounded_head_job_evidence_and_fail_closed_shapes() -> None:
@@ -1755,6 +1996,16 @@ def test_github_reader_additional_shape_failures() -> None:
         ).release_pr_numbers(REPO)
     with pytest.raises(CiWatchError, match="PR #10 is not an object"):
         GitHubReader("gh", QueueRunner(CommandResult(0, "[]"))).release_pr(REPO, 10)
+    with pytest.raises(CiWatchError, match="invalid allow_squash_merge"):
+        GitHubReader(
+            "gh",
+            QueueRunner(
+                CommandResult(
+                    0,
+                    '{"default_branch":"master","allow_squash_merge":"yes"}',
+                )
+            ),
+        ).merge_method_allowed(REPO, "squash")
 
     with pytest.raises(CiWatchError, match="invalid conclusion"):
         GitHubReader(

@@ -61,6 +61,11 @@ RELEASE_VERSION_PATTERN = re.compile(
 )
 REMOVED_CONFIG_KEYS = frozenset({"max_fix_proposals_per_tick", "red_debounce_ticks", "fix_enabled"})
 _MERGE_METHOD_FLAGS = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}
+_MERGE_METHOD_METADATA_KEYS = {
+    "merge": "allow_merge_commit",
+    "squash": "allow_squash_merge",
+    "rebase": "allow_rebase_merge",
+}
 DEFAULT_HEAVY_MAX_AGE_HOURS = 6.0
 
 type JsonObject = dict[str, Any]
@@ -538,6 +543,22 @@ class ReleasePr:
 
 
 @dataclass(frozen=True)
+class ReleaseSettings:
+    merge_method: str
+    gating_workflows: tuple[str, ...]
+    heavy_workflows: tuple[str, ...]
+    heavy_max_age_hours: float
+
+
+DEFAULT_RELEASE_SETTINGS = ReleaseSettings(
+    merge_method="merge",
+    gating_workflows=(),
+    heavy_workflows=(),
+    heavy_max_age_hours=DEFAULT_HEAVY_MAX_AGE_HOURS,
+)
+
+
+@dataclass(frozen=True)
 class MergePlan:
     repo: str
     pr: ReleasePr
@@ -660,10 +681,36 @@ def _evaluate_heavy_lane(
     return None
 
 
+@dataclass(frozen=True)
+class RepositoryMetadata:
+    default_branch: str
+    allowed_merge_methods: frozenset[str]
+
+    @classmethod
+    def from_json(cls, repo: str, value: Mapping[str, Any]) -> RepositoryMetadata:
+        allowed: set[str] = set()
+        for method, key in _MERGE_METHOD_METADATA_KEYS.items():
+            raw_allowed = value.get(key)
+            if raw_allowed is not None and not isinstance(raw_allowed, bool):
+                raise CiWatchError(f"{repo} metadata has an invalid {key}")
+            if raw_allowed is True:
+                allowed.add(method)
+        return cls(
+            default_branch=_branch(value.get("default_branch")),
+            allowed_merge_methods=frozenset(allowed),
+        )
+
+    def allows_merge_method(self, merge_method: str) -> bool:
+        if merge_method not in _MERGE_METHOD_FLAGS:
+            raise CiWatchError("merge_method must be one of: merge, squash, rebase")
+        return merge_method in self.allowed_merge_methods
+
+
 class GitHubReader:
     def __init__(self, executable: str, runner: CommandRunner = run_command) -> None:
         self.executable = executable
         self._runner = runner
+        self._metadata: dict[str, RepositoryMetadata] = {}
 
     def _json(self, argv: Sequence[str], *, source: str) -> Any:
         result = self._runner([self.executable, *argv])
@@ -675,12 +722,21 @@ class GitHubReader:
         except json.JSONDecodeError as error:
             raise CiWatchError(f"{source} returned malformed JSON: {error}") from error
 
-    def default_branch_head(self, repo: str) -> BranchHead:
+    def _repository_metadata(self, repo: str) -> RepositoryMetadata:
         repo = _repo(repo)
+        cached = self._metadata.get(repo)
+        if cached is not None:
+            return cached
         metadata = self._json(["api", f"repos/{repo}"], source=f"{repo} metadata")
         if not isinstance(metadata, dict):
             raise CiWatchError(f"{repo} metadata is not an object")
-        branch = _branch(metadata.get("default_branch"))
+        parsed = RepositoryMetadata.from_json(repo, metadata)
+        self._metadata[repo] = parsed
+        return parsed
+
+    def default_branch_head(self, repo: str) -> BranchHead:
+        repo = _repo(repo)
+        branch = self._repository_metadata(repo).default_branch
         commit = self._json(
             ["api", f"repos/{repo}/commits/{quote(branch, safe='')}"],
             source=f"{repo} default branch head",
@@ -688,6 +744,9 @@ class GitHubReader:
         if not isinstance(commit, dict):
             raise CiWatchError(f"{repo} default branch head is not an object")
         return BranchHead(branch, _sha(commit.get("sha")))
+
+    def merge_method_allowed(self, repo: str, merge_method: str) -> bool:
+        return self._repository_metadata(repo).allows_merge_method(merge_method)
 
     def workflow_count(self, repo: str) -> int:
         repo = _repo(repo)
@@ -992,10 +1051,31 @@ class Config:
     merge_order: tuple[str, ...]
     max_merges: int
     merge_enabled: bool
-    merge_method: str
-    gating_workflows: tuple[str, ...]
-    heavy_workflows: tuple[str, ...]
-    heavy_max_age_hours: float
+    default_release_settings: ReleaseSettings
+    release_settings: tuple[tuple[str, ReleaseSettings], ...]
+
+    @property
+    def merge_method(self) -> str:
+        return self.default_release_settings.merge_method
+
+    @property
+    def gating_workflows(self) -> tuple[str, ...]:
+        return self.default_release_settings.gating_workflows
+
+    @property
+    def heavy_workflows(self) -> tuple[str, ...]:
+        return self.default_release_settings.heavy_workflows
+
+    @property
+    def heavy_max_age_hours(self) -> float:
+        return self.default_release_settings.heavy_max_age_hours
+
+    def release_settings_for(self, repo: str) -> ReleaseSettings:
+        repo = _repo(repo)
+        for candidate, settings in self.release_settings:
+            if candidate == repo:
+                return settings
+        raise CiWatchError(f"release repository {repo!r} has no release settings")
 
     @classmethod
     def from_invocation(cls, invocation: ChopInvocation) -> Config:
@@ -1029,8 +1109,7 @@ class Config:
         for repo in merge_order:
             if repo not in release_repositories:
                 raise CiWatchError(f"merge_order repository {repo!r} is not release-enabled")
-        gating_workflows = _string_list(values.get("gating_workflows", []), "gating_workflows")
-        heavy_workflows = _string_list(values.get("heavy_workflows", []), "heavy_workflows")
+        default_release_settings, release_settings = _release_settings(values, release_repositories)
         return cls(
             actstat_bin=_binary(values, "actstat_bin", "actstat"),
             gh_bin=_binary(values, "gh_bin", "gh"),
@@ -1040,12 +1119,8 @@ class Config:
             merge_order=merge_order,
             max_merges=_positive_int(values, "max_merges_per_tick", 1),
             merge_enabled=_bool(values, "merge_enabled", False),
-            merge_method=_merge_method(values),
-            gating_workflows=gating_workflows,
-            heavy_workflows=heavy_workflows,
-            heavy_max_age_hours=_positive_number(
-                values, "heavy_max_age_hours", DEFAULT_HEAVY_MAX_AGE_HOURS
-            ),
+            default_release_settings=default_release_settings,
+            release_settings=release_settings,
         )
 
 
@@ -1090,18 +1165,121 @@ def _bool(values: Mapping[str, Any], key: str, default: bool) -> bool:
     return value
 
 
-def _merge_method(values: Mapping[str, Any]) -> str:
-    value = values.get("merge_method", "merge")
+def _merge_method_value(value: object, name: str) -> str:
     if not isinstance(value, str) or value not in _MERGE_METHOD_FLAGS:
-        raise CiWatchError("merge_method must be one of: merge, squash, rebase")
+        raise CiWatchError(f"{name} must be one of: merge, squash, rebase")
     return value
 
 
-def _positive_number(values: Mapping[str, Any], key: str, default: float) -> float:
-    value = values.get(key, default)
+def _positive_number_value(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
-        raise CiWatchError(f"{key} must be a positive number")
+        raise CiWatchError(f"{name} must be a positive number")
     return float(value)
+
+
+def _release_setting_key(
+    value: object,
+    *,
+    field_name: str,
+    release_repositories: Sequence[str],
+) -> str | None:
+    if not isinstance(value, str):
+        raise CiWatchError(f"{field_name} mapping keys must be repository strings or 'default'")
+    key = value.strip()
+    if key == "default":
+        return None
+    repo = _repo(key)
+    if repo not in release_repositories:
+        raise CiWatchError(f"{field_name} contains unknown release repository {repo!r}")
+    return repo
+
+
+def _release_setting_values[T](
+    values: Mapping[str, Any],
+    key: str,
+    release_repositories: Sequence[str],
+    built_in: T,
+    parser: Callable[[object, str], T],
+) -> tuple[T, dict[str, T]]:
+    if key not in values:
+        return built_in, {}
+    raw = values[key]
+    if isinstance(raw, Mapping):
+        default = built_in
+        by_repo: dict[str, T] = {}
+        seen: set[str] = set()
+        for raw_key, raw_value in raw.items():
+            repo = _release_setting_key(
+                raw_key,
+                field_name=key,
+                release_repositories=release_repositories,
+            )
+            label = f"{key}.{raw_key}" if isinstance(raw_key, str) else key
+            parsed = parser(raw_value, label)
+            if repo is None:
+                if "default" in seen:
+                    raise CiWatchError(f"{key} mapping contains duplicate default")
+                seen.add("default")
+                default = parsed
+                continue
+            if repo in seen:
+                raise CiWatchError(f"{key} mapping contains duplicate repository {repo!r}")
+            seen.add(repo)
+            by_repo[repo] = parsed
+        return default, by_repo
+    return parser(raw, key), {}
+
+
+def _release_settings(
+    values: Mapping[str, Any],
+    release_repositories: Sequence[str],
+) -> tuple[ReleaseSettings, tuple[tuple[str, ReleaseSettings], ...]]:
+    default_merge_method, merge_methods = _release_setting_values(
+        values,
+        "merge_method",
+        release_repositories,
+        DEFAULT_RELEASE_SETTINGS.merge_method,
+        _merge_method_value,
+    )
+    default_gating_workflows, gating_workflows = _release_setting_values(
+        values,
+        "gating_workflows",
+        release_repositories,
+        DEFAULT_RELEASE_SETTINGS.gating_workflows,
+        _string_list,
+    )
+    default_heavy_workflows, heavy_workflows = _release_setting_values(
+        values,
+        "heavy_workflows",
+        release_repositories,
+        DEFAULT_RELEASE_SETTINGS.heavy_workflows,
+        _string_list,
+    )
+    default_heavy_max_age_hours, heavy_max_age_hours = _release_setting_values(
+        values,
+        "heavy_max_age_hours",
+        release_repositories,
+        DEFAULT_RELEASE_SETTINGS.heavy_max_age_hours,
+        _positive_number_value,
+    )
+    default_settings = ReleaseSettings(
+        merge_method=default_merge_method,
+        gating_workflows=default_gating_workflows,
+        heavy_workflows=default_heavy_workflows,
+        heavy_max_age_hours=default_heavy_max_age_hours,
+    )
+    return default_settings, tuple(
+        (
+            repo,
+            ReleaseSettings(
+                merge_method=merge_methods.get(repo, default_merge_method),
+                gating_workflows=gating_workflows.get(repo, default_gating_workflows),
+                heavy_workflows=heavy_workflows.get(repo, default_heavy_workflows),
+                heavy_max_age_hours=heavy_max_age_hours.get(repo, default_heavy_max_age_hours),
+            ),
+        )
+        for repo in release_repositories
+    )
 
 
 def _dry_run_mode() -> str:
@@ -1448,6 +1626,7 @@ _RELEASE_REASON_LABELS = {
     "merge_cap_reached": "merge cap reached",
     "merge_disabled": "merge disabled",
     "merge_context_unavailable": "merge context unavailable",
+    "merge_method_not_allowed": "merge method disabled",
     "dry_run": "dry run",
     "merge_failed": "merge failed",
     "merged": "merged",
@@ -1826,7 +2005,7 @@ def _send_required_notifications(
 
 def _evaluate_release_branch(
     github: GitHubReader,
-    config: Config,
+    settings: ReleaseSettings,
     repo: str,
     actstat_state: RepoState,
     actstat_head: BranchHead | None,
@@ -1839,10 +2018,10 @@ def _evaluate_release_branch(
     repository ineligible only because of unrelated actstat noise can still release.
     """
     head: BranchHead | None
-    if config.gating_workflows:
+    if settings.gating_workflows:
         head = actstat_head or github.default_branch_head(repo)
         evidence = github.head_ci_evidence(repo, head.sha)
-        reason = _release_gate_reason(evidence, config.gating_workflows)
+        reason = _release_gate_reason(evidence, settings.gating_workflows)
     else:
         head = actstat_head
         reason = None if actstat_state is RepoState.GREEN else "default_branch_not_green"
@@ -1850,9 +2029,9 @@ def _evaluate_release_branch(
         return head, False, reason or "default_branch_not_green"
     runs = github.workflow_runs(repo, head.branch)
     busy = _is_generator_busy(repo, runs)
-    if config.heavy_workflows:
+    if settings.heavy_workflows:
         heavy_reason = _evaluate_heavy_lane(
-            repo, runs, config.heavy_workflows, config.heavy_max_age_hours, now
+            repo, runs, settings.heavy_workflows, settings.heavy_max_age_hours, now
         )
         if heavy_reason is not None:
             return head, busy, heavy_reason
@@ -1987,6 +2166,7 @@ def build_ci_watch_result(
     release_heads: dict[str, BranchHead] = {}
     for repo in _release_order(config):
         release_observation = release_observations[repo]
+        settings = config.release_settings_for(repo)
         plan = None
         evaluated = False
         if release_observation.numbers is None:
@@ -1995,13 +2175,13 @@ def build_ci_watch_result(
             reason = "no_release_pr"
         elif release_observation.error is not None:
             reason = release_observation.error
-        elif states[repo] is not RepoState.GREEN and not config.gating_workflows:
+        elif states[repo] is not RepoState.GREEN and not settings.gating_workflows:
             reason = "default_branch_not_green"
         else:
             evaluated = True
             try:
                 release_head, busy, gate_reason = _evaluate_release_branch(
-                    github, config, repo, states[repo], heads.get(repo), now
+                    github, settings, repo, states[repo], heads.get(repo), now
                 )
                 if gate_reason is not None:
                     plan, reason = None, gate_reason
@@ -2014,7 +2194,7 @@ def build_ci_watch_result(
                         release_head.branch,
                         release_observation.prs,
                         generator_busy=busy,
-                        merge_method=config.merge_method,
+                        merge_method=settings.merge_method,
                     )
                     if plan is not None:
                         release_heads[repo] = release_head
@@ -2033,6 +2213,7 @@ def build_ci_watch_result(
 
     for plan in release_plans:
         repo = plan.repo
+        settings = config.release_settings_for(repo)
         if counters["merged"] >= config.max_merges:
             counters["merge_skipped"] += 1
             reason = "merge_cap_reached"
@@ -2066,18 +2247,22 @@ def build_ci_watch_result(
                 current = plan.pr
             else:
                 gate_reason = None
-                if config.gating_workflows:
+                if settings.gating_workflows:
                     evidence = github.head_ci_evidence(repo, current_head.sha)
-                    gate_reason = _release_gate_reason(evidence, config.gating_workflows)
+                    gate_reason = _release_gate_reason(evidence, settings.gating_workflows)
                 if gate_reason is not None:
                     current_plan, current_reason, current = None, gate_reason, plan.pr
                 else:
                     runs = github.workflow_runs(repo, current_head.branch)
                     heavy_reason = (
                         _evaluate_heavy_lane(
-                            repo, runs, config.heavy_workflows, config.heavy_max_age_hours, now
+                            repo,
+                            runs,
+                            settings.heavy_workflows,
+                            settings.heavy_max_age_hours,
+                            now,
                         )
-                        if config.heavy_workflows
+                        if settings.heavy_workflows
                         else None
                     )
                     if heavy_reason is not None:
@@ -2090,7 +2275,7 @@ def build_ci_watch_result(
                             current_head.branch,
                             [current],
                             generator_busy=_is_generator_busy(repo, runs),
-                            merge_method=config.merge_method,
+                            merge_method=plan.merge_method,
                         )
             if current_plan is None or current.head_oid != plan.pr.head_oid:
                 reason = (
@@ -2100,6 +2285,19 @@ def build_ci_watch_result(
                 )
                 counters["merge_skipped"] += 1
                 _mark(ledger_repos, repo, reason=reason, release_reason=reason)
+                release_decisions[repo] = reason
+                continue
+            if not github.merge_method_allowed(repo, current_plan.merge_method):
+                counters["merge_skipped"] += 1
+                reason = "merge_method_not_allowed"
+                _mark(
+                    ledger_repos,
+                    repo,
+                    reason=reason,
+                    release_reason=reason,
+                    planned_pr=current_plan.pr.number,
+                    merge_method=current_plan.merge_method,
+                )
                 release_decisions[repo] = reason
                 continue
             merge_result = github.merge(current_plan)
@@ -2122,7 +2320,7 @@ def build_ci_watch_result(
             release_decisions[repo] = reason
             continue
         counters["merged"] += 1
-        _append_release_record(state, repo, current, now, config.merge_method)
+        _append_release_record(state, repo, current, now, current_plan.merge_method)
         try:
             _write_state(invocation, state)
         except OSError as error:
@@ -2134,6 +2332,7 @@ def build_ci_watch_result(
             release_reason="merged",
             merged_pr=current.number,
             head_oid=current.head_oid,
+            merge_method=current_plan.merge_method,
         )
         release_decisions[repo] = "merged"
 
@@ -2203,7 +2402,12 @@ def build_ci_watch_result(
         "mode": mode,
         "repositories": ledger_repos,
         "release_plans": [
-            {"repo": plan.repo, "number": plan.pr.number, "head_oid": plan.pr.head_oid}
+            {
+                "repo": plan.repo,
+                "number": plan.pr.number,
+                "head_oid": plan.pr.head_oid,
+                "merge_method": plan.merge_method,
+            }
             for plan in release_plans
         ],
         "notification_errors": operational_errors,

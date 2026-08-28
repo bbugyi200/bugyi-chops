@@ -18,9 +18,10 @@ for those proposals.
 `bugyi_chop_ci_watch` is deliberately narrower. It never creates gates, launch
 requests, repair prompts, or Axe proposals. Its only mutation outside its own state and
 report files is a guarded `gh pr merge --merge|--squash|--rebase --match-head-commit`
-(the flag follows `vars.merge_method`, default `merge`) for an eligible release-please
-PR when `vars.merge_enabled` is true and `SASE_CHOP_DRY_RUN=0` is explicitly present.
-Missing or true dry-run context suppresses merging and notifications.
+(the flag follows the repository's resolved `vars.merge_method`, default `merge`) for
+an eligible release-please PR when `vars.merge_enabled` is true and
+`SASE_CHOP_DRY_RUN=0` is explicitly present. Missing or true dry-run context suppresses
+merging and notifications.
 
 ## Installation
 
@@ -88,11 +89,13 @@ on the next live tick.
 Release handling is release-please only. Configure `vars.release_repositories` as a
 list of repositories from `vars.repos`; generator mappings are rejected and other
 release branch families are ignored. A release PR is mergeable only when all guards
-pass: exactly one release-please candidate for the repository, configured default base, non-draft,
-mergeable and clean, non-empty fully green check rollup, a green current default branch,
-idle release-please/publish workflow, deterministic dependency order,
-`max_merges_per_tick`, explicit live mode, a final PR/default-branch reread, and
-`--match-head-commit` race protection.
+pass: exactly one release-please candidate for the repository, configured default base,
+non-draft, mergeable and clean, non-empty fully green check rollup, a green current
+default branch, idle release-please/publish workflow, deterministic dependency order,
+`max_merges_per_tick`, explicit live mode, a final PR/default-branch reread, repository
+metadata allowing the chosen merge strategy, and `--match-head-commit` race protection.
+When GitHub reports the configured strategy disabled for that repository, the chop
+records `merge_method_not_allowed` and does not call `gh pr merge`.
 
 By default "a green current default branch" means the actstat sweep classified it green.
 Configuring `vars.gating_workflows` (a list of workflow names, empty by default) switches
@@ -108,6 +111,14 @@ reported as `heavy_lane_not_green` or `heavy_lane_stale` otherwise. Both allowli
 re-checked, from a freshly fetched HEAD, during the final pre-merge reread. Leaving both
 lists empty preserves the pre-existing actstat-only behavior. `vars.merge_method`
 (`merge`, `squash`, or `rebase`; default `merge`) selects the `gh pr merge` flag.
+
+`vars.merge_method`, `vars.gating_workflows`, `vars.heavy_workflows`, and
+`vars.heavy_max_age_hours` each accept either the flat form shown above or a mapping.
+Mapping keys are release repository names in `owner/repo` form plus the reserved
+`default` key. Resolution is explicit repository entry, then mapping `default`, then the
+built-in default (`merge`, empty workflow lists, and `6` hours). Unknown repositories,
+non-string keys, malformed values, and invalid merge methods fail closed before the
+chop starts work.
 
 Successful merge submissions are written durably with `notification_sent: false` before
 any SASE notification is attempted. The release notification is marked delivered only
@@ -139,6 +150,24 @@ vars:
   gating_workflows: [CI]
   heavy_workflows: [E2E]
   heavy_max_age_hours: 6
+```
+
+Configuration with repository-specific release settings:
+
+```yaml
+vars:
+  # ... same as above ...
+  merge_method:
+    default: squash
+    sase-org/sase: merge
+  gating_workflows:
+    default: []
+    sase-org/sase: ["Master Gate"]
+  heavy_workflows:
+    default: []
+    sase-org/sase: ["Full CI"]
+  heavy_max_age_hours:
+    default: 6
 ```
 
 ## `toobig_split`
