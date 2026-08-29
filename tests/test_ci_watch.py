@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,6 +15,7 @@ from sase.core.axe_chop_facade import validate_chop_result
 
 import bugyi_chops.ci_watch as ci_watch_module
 from bugyi_chops.ci_watch import (
+    GITHUB_JSON_ENV,
     LEGACY_RELEASE_LEDGER_FILE_NAME,
     REPORT_FILE_NAME,
     STATE_FILE_NAME,
@@ -34,6 +37,7 @@ from bugyi_chops.ci_watch import (
     build_ci_watch_result,
     classify_repo,
     decide_repo,
+    github_command_env,
     main,
     plan_release_merge,
     run_command,
@@ -2052,6 +2056,81 @@ def test_github_reader_additional_shape_failures() -> None:
                 ),
             ),
         ).head_ci_evidence(REPO, SHA)
+
+
+def test_github_command_env_overrides_color_without_dropping_inherited_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLICOLOR", "1")
+    monkeypatch.setenv("GH_FORCE_TTY", "1")
+    monkeypatch.setenv("NO_COLOR", "0")
+    monkeypatch.setenv("CI_WATCH_SENTINEL", "keep-me")
+
+    env = github_command_env()
+
+    assert env["GH_FORCE_TTY"] == "0"
+    assert env["NO_COLOR"] == "1"
+    assert env["CLICOLOR"] == "0"
+    assert env["CI_WATCH_SENTINEL"] == "keep-me"
+    assert env["PATH"] == os.environ["PATH"]
+    assert github_command_env({"KEEP": "yes", "CLICOLOR": "1"}) == {
+        "KEEP": "yes",
+        **GITHUB_JSON_ENV,
+    }
+
+
+def test_github_reader_forces_plain_json_env_from_colorful_ambient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_dump = tmp_path / "gh-env.json"
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, sys",
+                "from pathlib import Path",
+                f"Path({env_dump.as_posix()!r}).write_text(json.dumps(dict(os.environ)))",
+                "sys.stdout.write(json.dumps({'total_count': 0}))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("CLICOLOR", "1")
+    monkeypatch.setenv("GH_FORCE_TTY", "1")
+    monkeypatch.setenv("NO_COLOR", "0")
+    monkeypatch.setenv("CI_WATCH_SENTINEL", "keep-me")
+
+    count = GitHubReader(str(fake_gh)).workflow_count(REPO)
+    captured = json.loads(env_dump.read_text(encoding="utf-8"))
+
+    assert count == 0
+    assert captured["GH_FORCE_TTY"] == "0"
+    assert captured["NO_COLOR"] == "1"
+    assert captured["CLICOLOR"] == "0"
+    assert captured["CI_WATCH_SENTINEL"] == "keep-me"
+
+
+def test_github_reader_restores_ambient_color_env_after_forced_gh_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLICOLOR", "1")
+    monkeypatch.setenv("GH_FORCE_TTY", "1")
+    monkeypatch.setenv("NO_COLOR", "0")
+    GitHubReader("gh", QueueRunner(CommandResult(0, '{"total_count":0}'))).workflow_count(REPO)
+    assert os.environ["CLICOLOR"] == "1"
+    assert os.environ["GH_FORCE_TTY"] == "1"
+    assert os.environ["NO_COLOR"] == "0"
+
+    monkeypatch.delenv("GH_FORCE_TTY", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("CLICOLOR", raising=False)
+    GitHubReader("gh", QueueRunner(CommandResult(0, '{"total_count":0}'))).workflow_count(REPO)
+    assert "GH_FORCE_TTY" not in os.environ
+    assert "NO_COLOR" not in os.environ
+    assert "CLICOLOR" not in os.environ
 
 
 def test_github_reader_command_json_and_workflow_label_failures() -> None:

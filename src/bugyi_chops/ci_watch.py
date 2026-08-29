@@ -8,8 +8,8 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -67,6 +67,11 @@ _MERGE_METHOD_METADATA_KEYS = {
     "rebase": "allow_rebase_merge",
 }
 DEFAULT_HEAVY_MAX_AGE_HOURS = 6.0
+GITHUB_JSON_ENV = {
+    "GH_FORCE_TTY": "0",
+    "NO_COLOR": "1",
+    "CLICOLOR": "0",
+}
 
 type JsonObject = dict[str, Any]
 
@@ -100,11 +105,34 @@ class CommandRunner(Protocol):
     ) -> CommandResult: ...
 
 
+def github_command_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Copy *base* (or the process environment) and force plain ``gh`` JSON output."""
+
+    env = dict(os.environ if base is None else base)
+    env.update(GITHUB_JSON_ENV)
+    return env
+
+
+@contextmanager
+def _github_json_env() -> Iterator[None]:
+    previous = {key: os.environ.get(key) for key in GITHUB_JSON_ENV}
+    os.environ.update(GITHUB_JSON_ENV)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run_command(
     argv: Sequence[str],
     *,
     input_text: str | None = None,
     cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     try:
         completed = subprocess.run(
@@ -114,6 +142,7 @@ def run_command(
             text=True,
             check=False,
             cwd=cwd,
+            env=None if env is None else dict(env),
         )
     except OSError as error:
         raise CiWatchError(f"failed to execute {argv[0]}: {error}") from error
@@ -712,8 +741,16 @@ class GitHubReader:
         self._runner = runner
         self._metadata: dict[str, RepositoryMetadata] = {}
 
+    def _run(self, argv: Sequence[str], *, input_text: str | None = None) -> CommandResult:
+        command = [self.executable, *argv]
+        env = github_command_env()
+        with _github_json_env():
+            if self._runner is run_command:
+                return run_command(command, input_text=input_text, env=env)
+            return self._runner(command, input_text=input_text)
+
     def _json(self, argv: Sequence[str], *, source: str) -> Any:
-        result = self._runner([self.executable, *argv])
+        result = self._run(argv)
         if result.returncode != 0:
             detail = _bounded(result.stderr or result.stdout) or "-"
             raise CiWatchError(f"{source} failed: exit_code={result.returncode} detail={detail}")
@@ -987,9 +1024,8 @@ class GitHubReader:
         return ReleasePr.from_json(data)
 
     def merge(self, plan: MergePlan) -> CommandResult:
-        return self._runner(
+        return self._run(
             [
-                self.executable,
                 "pr",
                 "merge",
                 str(plan.pr.number),
