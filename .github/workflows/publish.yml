@@ -7,48 +7,25 @@ on:
 permissions:
   contents: read
 
-env:
-  SASE_CORE_DIR: ${{ github.workspace }}/.deps/sase-core
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out the SDK-bearing SASE source
-        uses: actions/checkout@v4
-        with:
-          repository: sase-org/sase
-          path: .deps/sase
-      - name: Check out the matching Rust core
-        uses: actions/checkout@v4
-        with:
-          repository: sase-org/sase-core
-          path: .deps/sase-core
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
           enable-cache: true
-      - uses: dtolnay/rust-toolchain@stable
       - uses: extractions/setup-just@v3
-      - name: Build and install the current SASE SDK and core
-        working-directory: .deps/sase
-        env:
-          UV_PYTHON: "3.12"
-        run: just install
-      - name: Install bugyi-chops into the SASE development environment
-        env:
-          BUGYI_CHOPS_VENV_BIN: ${{ github.workspace }}/.deps/sase/.venv/bin
+      - name: Install package from public indexes
         run: just install
       - name: Check package
-        env:
-          BUGYI_CHOPS_VENV_BIN: ${{ github.workspace }}/.deps/sase/.venv/bin
         run: just check
       - name: Verify tag matches package version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          .deps/sase/.venv/bin/python - <<'PY'
+          .venv/bin/python - <<'PY'
           import os
           import tomllib
           from pathlib import Path

@@ -28,7 +28,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "sase>=0.16.0,<0.17.0",
+    "sase>=0.17.0,<0.18.0",
     "toobig>=0.1.0,<0.2.0",
 ]
 

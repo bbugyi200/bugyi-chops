@@ -36,8 +36,8 @@ published index distribution; it is not a development install. For local develop
 against this repository, see [Development and releases](#development-and-releases)
 below.
 
-All scripts require Python 3.12 or newer and `sase>=0.16.0,<0.17`. SASE 0.16.0 is the
-first compatible release series for typed Axe chop admission with `%if`. The package
+All scripts require Python 3.12 or newer and `sase>=0.17.0,<0.18`. SASE 0.17.0 is the
+first compatible release series for repository-scoped release gates. The package
 also installs the `toobig` scanner used by `bugyi_chop_toobig_split`.
 
 ## The chop result contract
@@ -206,9 +206,8 @@ stale: the leased checkout synchronizes from the configured upstream before `%if
 The proposal skips when the target file is gone or has dropped below the configured
 floor (`min(limits)`, 700 lines in the default configuration) in that freshly leased
 checkout. A read/count failure for an existing file is a visible condition error. This
-requires SASE's `typed_launch_units` flag and a compatible
-SASE 0.16.x runtime; older SASE 0.13.x runtimes reject these directives before model
-dispatch.
+requires SASE's `typed_launch_units` flag and a compatible SASE 0.17.x runtime; older
+SASE 0.13.x runtimes reject these directives before model dispatch.
 
 The structured `@medium` field is the only model source. It selects SASE's
 configurable, load-balanced alias pool rather than pinning a concrete
