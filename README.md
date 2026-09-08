@@ -79,12 +79,17 @@ evidence: workflow name, job name, conclusion, direct job/run URL, failing steps
 failing SHA, and current-head SHA when a stale settled failure is still actionable
 while newer HEAD checks are unsettled.
 
-Failure notifications are incident-based. The state file `ci_watch_state.json` tracks
-the active failing-job fingerprint per repository, independent of SHA. The same
-failure is announced once and kept active while it persists; changed job/step evidence
-replaces the incident; a green or non-red observation clears it so a later recurrence
-is announced again. Failed notification deliveries remain marked unsent and are retried
-on the next live tick.
+Failure notifications are incident-combination based. The state file
+`ci_watch_state.json` tracks per-repository failing-job fingerprints as the delta
+source, plus one active incident covering the announced failing-repo set. Concurrent
+failures produce a single `sase notify create` row (`-k ci-failure/<repos> -p …`);
+material fingerprint churn, recoveries, and re-failures within that set add a quiet
+`sase notify +1` note; a repo the current notification does not cover going red
+creates a new row and supersedes the previous one (`-S`). All-green clears the
+incident with a resolution +1 so a later recurrence is announced again. Failed
+deliveries remain unsent and are retried on the next live tick. If the installed
+`sase` CLI does not yet understand `-k` / `notify +1`, the chop falls back to the
+legacy per-repository `sase notify create` flow for that tick.
 
 Release handling is release-please only. Configure `vars.release_repositories` as a
 list of repositories from `vars.repos`; generator mappings are rejected and other
@@ -123,6 +128,8 @@ chop starts work.
 Successful merge submissions are written durably with `notification_sent: false` before
 any SASE notification is attempted. The release notification is marked delivered only
 after `sase notify create` succeeds, so a later tick retries an unsent release notice.
+Failure notifications use `sase notify create` with a dedup key (and `sase notify +1`
+for later corroboration) on a current SASE, with the same retry rule.
 If report publication fails, inline notifications still include the full evidence but
 omit the `ViewReport` action and the chop returns `check_error` so the failure is
 visible.

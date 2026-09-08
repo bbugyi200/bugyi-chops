@@ -50,7 +50,10 @@ MAX_STATE_RELEASES = 50
 MAX_FAILURE_JOBS_PER_NOTIFICATION = 8
 MAX_STEPS_PER_JOB = 5
 MAX_TEXT = 240
+MAX_PLUS_ONE_NOTE = 512
 STATE_FILE_NAME = "ci_watch_state.json"
+STATE_VERSION = 2
+SUPPORTED_STATE_VERSIONS = frozenset({1, 2})
 LEGACY_RELEASE_LEDGER_FILE_NAME = "ci_watch_releases.json"
 LEGACY_RELEASE_REPORT_FILE_NAME = "ci_watch_releases.report.json"
 REPORT_FILE_NAME = "ci_watch.report.json"
@@ -93,6 +96,15 @@ class CommandResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+
+
+@dataclass(frozen=True)
+class NotifyOutcome:
+    """Parsed `sase notify create -k` / `sase notify +1` result."""
+
+    action: str
+    id: str | None = None
+    unsupported: bool = False
 
 
 class CommandRunner(Protocol):
@@ -1038,6 +1050,85 @@ class GitHubReader:
         )
 
 
+def _notification_payload(
+    notes: Sequence[str],
+    *,
+    icon: str,
+    tags: Sequence[str],
+    action: str | None = None,
+    action_data: Mapping[str, str] | None = None,
+) -> JsonObject:
+    payload_data: JsonObject = {
+        "notes": [_bounded(note, limit=512) for note in notes],
+        "tags": [_bounded(tag, limit=64) for tag in tags],
+        "icon": _bounded(icon, limit=16),
+    }
+    if action is not None:
+        payload_data["action"] = _bounded(action, limit=64)
+    if action_data is not None:
+        payload_data["action_data"] = {
+            _bounded(key, limit=64): _bounded(value, limit=4096)
+            for key, value in action_data.items()
+        }
+    return payload_data
+
+
+def _notify_surface_unsupported(result: CommandResult) -> bool:
+    if result.returncode == 0:
+        return False
+    blob = f"{result.stderr}\n{result.stdout}".lower()
+    return "unrecognized arguments" in blob or "invalid choice" in blob
+
+
+def _parse_notify_outcome(result: CommandResult, *, default_action: str) -> NotifyOutcome:
+    if _notify_surface_unsupported(result):
+        return NotifyOutcome(action="unsupported", unsupported=True)
+    if result.returncode != 0:
+        detail = _bounded(result.stderr or result.stdout) or "-"
+        raise CiWatchError(f"notification failed: exit_code={result.returncode} detail={detail}")
+    for line in reversed(result.stdout.splitlines()):
+        text = line.strip()
+        if not text:
+            continue
+        with suppress(json.JSONDecodeError):
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("action"), str):
+                ident = parsed.get("id")
+                return NotifyOutcome(
+                    action=str(parsed["action"]),
+                    id=None if ident is None else str(ident),
+                )
+        return NotifyOutcome(action=default_action, id=text)
+    raise CiWatchError("notification failed: empty outcome")
+
+
+class CiWatchNotifier(Protocol):
+    def notify(
+        self,
+        notes: Sequence[str],
+        *,
+        icon: str,
+        tags: Sequence[str],
+        action: str | None = None,
+        action_data: Mapping[str, str] | None = None,
+    ) -> None: ...
+
+    def notify_upsert(
+        self,
+        notes: Sequence[str],
+        *,
+        icon: str,
+        tags: Sequence[str],
+        dedup_key: str,
+        plus_one_note: str,
+        supersedes: str | None = None,
+        action: str | None = None,
+        action_data: Mapping[str, str] | None = None,
+    ) -> NotifyOutcome: ...
+
+    def notify_plus_one(self, *, dedup_key: str, note: str) -> NotifyOutcome: ...
+
+
 class SaseNotifier:
     """Send ci_watch SASE notifications and nothing else."""
 
@@ -1054,27 +1145,60 @@ class SaseNotifier:
         action: str | None = None,
         action_data: Mapping[str, str] | None = None,
     ) -> None:
-        payload_data: JsonObject = {
-            "notes": [_bounded(note, limit=512) for note in notes],
-            "tags": [_bounded(tag, limit=64) for tag in tags],
-            "icon": _bounded(icon, limit=16),
-        }
-        if action is not None:
-            payload_data["action"] = _bounded(action, limit=64)
-        if action_data is not None:
-            payload_data["action_data"] = {
-                _bounded(key, limit=64): _bounded(value, limit=4096)
-                for key, value in action_data.items()
-            }
         result = self._runner(
             [self.executable, "notify", "create", "-s", CHOP_NAME],
-            input_text=json.dumps(payload_data),
+            input_text=json.dumps(
+                _notification_payload(
+                    notes, icon=icon, tags=tags, action=action, action_data=action_data
+                )
+            ),
         )
         if result.returncode != 0:
             detail = _bounded(result.stderr or result.stdout) or "-"
             raise CiWatchError(
                 f"notification failed: exit_code={result.returncode} detail={detail}"
             )
+
+    def notify_upsert(
+        self,
+        notes: Sequence[str],
+        *,
+        icon: str,
+        tags: Sequence[str],
+        dedup_key: str,
+        plus_one_note: str,
+        supersedes: str | None = None,
+        action: str | None = None,
+        action_data: Mapping[str, str] | None = None,
+    ) -> NotifyOutcome:
+        argv = [
+            self.executable,
+            "notify",
+            "create",
+            "-s",
+            CHOP_NAME,
+            "-k",
+            dedup_key,
+            "-p",
+            plus_one_note,
+        ]
+        if supersedes:
+            argv.extend(["-S", supersedes])
+        result = self._runner(
+            argv,
+            input_text=json.dumps(
+                _notification_payload(
+                    notes, icon=icon, tags=tags, action=action, action_data=action_data
+                )
+            ),
+        )
+        return _parse_notify_outcome(result, default_action="created")
+
+    def notify_plus_one(self, *, dedup_key: str, note: str) -> NotifyOutcome:
+        result = self._runner(
+            [self.executable, "notify", "+1", "-s", CHOP_NAME, "-k", dedup_key, note]
+        )
+        return _parse_notify_outcome(result, default_action="plus_oned")
 
 
 @dataclass(frozen=True)
@@ -1378,8 +1502,100 @@ def _extract_release_version(title: str) -> str:
     return match.group(1) if match is not None else "-"
 
 
+def _incident_dedup_key(repos: Sequence[str]) -> str:
+    return "ci-failure/" + ",".join(sorted(repos))
+
+
+def _compact_repo_names(repos: Sequence[str]) -> str:
+    ordered = list(repos)
+    owners = {repo.split("/", 1)[0] for repo in ordered}
+    if len(owners) == 1 and len(ordered) > 1:
+        labels = [repo.split("/", 1)[1] for repo in ordered]
+    else:
+        labels = list(ordered)
+    text = ", ".join(labels)
+    if len(ordered) > 2:
+        text += f" ({len(ordered)} repos)"
+    return text
+
+
+def _sanitize_incident(raw: object, allowed: set[str]) -> JsonObject | None:
+    if not isinstance(raw, dict):
+        return None
+    announced_raw = raw.get("announced")
+    if not isinstance(announced_raw, list) or not announced_raw:
+        return None
+    announced: list[str] = []
+    seen: set[str] = set()
+    for item in announced_raw:
+        if not isinstance(item, str) or item not in allowed:
+            continue
+        try:
+            repo = _repo(item)
+        except CiWatchError:
+            continue
+        if repo in seen:
+            continue
+        seen.add(repo)
+        announced.append(repo)
+    announced.sort()
+    if not announced:
+        return None
+    notification_sent = raw.get("notification_sent")
+    if not isinstance(notification_sent, bool):
+        return None
+    described: JsonObject = {}
+    raw_described = raw.get("described")
+    if isinstance(raw_described, dict):
+        for repo_key, fingerprint in raw_described.items():
+            if (
+                not isinstance(repo_key, str)
+                or repo_key not in allowed
+                or not isinstance(fingerprint, str)
+                or not re.fullmatch(r"[0-9a-f]{16}", fingerprint)
+            ):
+                continue
+            try:
+                described[_repo(repo_key)] = fingerprint
+            except CiWatchError:
+                continue
+    incident: JsonObject = {
+        "dedup_key": _incident_dedup_key(announced),
+        "announced": announced,
+        "notification_sent": notification_sent,
+        "described": described,
+    }
+    notified_at = raw.get("notified_at")
+    if isinstance(notified_at, str):
+        with suppress(ValueError):
+            _parse_timestamp(notified_at)
+            incident["notified_at"] = notified_at
+    return incident
+
+
+def _synthesize_incident(failures: Mapping[str, Any]) -> JsonObject | None:
+    announced: list[str] = []
+    described: JsonObject = {}
+    for repo, row in failures.items():
+        if not isinstance(row, dict) or row.get("notification_sent") is not True:
+            continue
+        announced.append(repo)
+        fingerprint = row.get("fingerprint")
+        if isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{16}", fingerprint):
+            described[repo] = fingerprint
+    if not announced:
+        return None
+    announced.sort()
+    return {
+        "dedup_key": _incident_dedup_key(announced),
+        "announced": announced,
+        "notification_sent": True,
+        "described": described,
+    }
+
+
 def _empty_state() -> JsonObject:
-    return {"version": 1, "failures": {}, "releases": []}
+    return {"version": STATE_VERSION, "failures": {}, "releases": [], "incident": None}
 
 
 def _release_key(repo: str, number: int) -> str:
@@ -1566,7 +1782,7 @@ def _load_state(invocation: ChopInvocation, now: datetime, repos: Sequence[str])
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         raw = None
-    if not isinstance(raw, dict) or raw.get("version") != 1:
+    if not isinstance(raw, dict) or raw.get("version") not in SUPPORTED_STATE_VERSIONS:
         state = _empty_state()
         state["releases"] = _legacy_release_rows(invocation, now)
         return state
@@ -1590,7 +1806,15 @@ def _load_state(invocation: ChopInvocation, now: datetime, repos: Sequence[str])
             if sanitized is not None:
                 releases.append(sanitized)
     releases.sort(key=lambda row: _parse_timestamp(str(row["submitted_at"])))
-    return {"version": 1, "failures": failures, "releases": releases[-MAX_STATE_RELEASES:]}
+    incident = _sanitize_incident(raw.get("incident"), allowed)
+    if incident is None:
+        incident = _synthesize_incident(failures)
+    return {
+        "version": STATE_VERSION,
+        "failures": failures,
+        "releases": releases[-MAX_STATE_RELEASES:],
+        "incident": incident,
+    }
 
 
 def _write_state(invocation: ChopInvocation, state: Mapping[str, Any]) -> None:
@@ -1899,6 +2123,437 @@ def _notification_action(report_path: Path | None) -> tuple[str | None, dict[str
     return "ViewReport", {"report_path": str(report_path), "report_title": "CI WATCH"}
 
 
+def _delta_job_hint(failure: FailureEvidence) -> str:
+    if not failure.jobs:
+        return "jobs"
+    first = failure.jobs[0]
+    label = f"{first.workflow} › {first.job}"
+    if len(failure.jobs) > 1:
+        label += f" ({len(failure.jobs)})"
+    return label
+
+
+def _aggregate_failure_notes(
+    failures: Mapping[str, FailureEvidence],
+    heads: Mapping[str, BranchHead],
+    repos: Sequence[str],
+) -> list[str]:
+    notes = [f"CI failure: {_compact_repo_names(repos)}"]
+    for repo in repos:
+        notes.extend(_failure_notification_notes(repo, failures[repo], heads.get(repo)))
+    return notes
+
+
+def _incident_create_plus_one_note(
+    failing: Sequence[str],
+    previous_announced: Sequence[str],
+) -> str:
+    previous = set(previous_announced)
+    if not previous:
+        return _bounded(f"CI failure: {_compact_repo_names(failing)}", limit=MAX_PLUS_ONE_NOTE)
+    started = [repo for repo in failing if repo not in previous]
+    still = [repo for repo in failing if repo in previous]
+    parts: list[str] = []
+    if started:
+        parts.append(f"{_compact_repo_names(started)} started failing")
+    if still:
+        parts.append(f"still failing: {_compact_repo_names(still)}")
+    return _bounded("; ".join(parts), limit=MAX_PLUS_ONE_NOTE)
+
+
+def _incident_resolution_note(announced: Sequence[str]) -> str:
+    return _bounded(f"all green: {_compact_repo_names(announced)}", limit=MAX_PLUS_ONE_NOTE)
+
+
+def _incident_delta_note(
+    *,
+    recovered: Sequence[str],
+    re_failed: Sequence[str],
+    changed: Sequence[str],
+    failures: Mapping[str, FailureEvidence],
+) -> str:
+    parts: list[str] = []
+    for repo in recovered:
+        parts.append(f"{repo} recovered")
+    for repo in re_failed:
+        parts.append(f"{repo} re-failed ({_delta_job_hint(failures[repo])})")
+    for repo in changed:
+        parts.append(f"{repo}: evidence changed ({_delta_job_hint(failures[repo])})")
+    return _bounded("; ".join(parts), limit=MAX_PLUS_ONE_NOTE)
+
+
+def _remember_incident(
+    state: JsonObject,
+    *,
+    announced: Sequence[str],
+    failures: Mapping[str, FailureEvidence],
+    sent: bool,
+    now: datetime,
+    described: Mapping[str, str] | None = None,
+) -> JsonObject:
+    announced_list = sorted(announced)
+    described_map: JsonObject = (
+        dict(described)
+        if described is not None
+        else {repo: failures[repo].fingerprint_key for repo in announced_list if repo in failures}
+    )
+    incident: JsonObject = {
+        "dedup_key": _incident_dedup_key(announced_list),
+        "announced": announced_list,
+        "notification_sent": sent,
+        "described": described_map,
+    }
+    if sent:
+        incident["notified_at"] = now.isoformat()
+    state["incident"] = incident
+    raw_failures = state.get("failures")
+    if isinstance(raw_failures, dict):
+        for repo, row in raw_failures.items():
+            if isinstance(row, dict) and repo in announced_list:
+                row["notification_sent"] = sent
+                if sent:
+                    row["notified_at"] = now.isoformat()
+    return incident
+
+
+def _record_incident_decision(
+    decision: JsonObject,
+    *,
+    action: str,
+    incident: Mapping[str, Any] | None,
+    outcome: NotifyOutcome | None = None,
+    plus_one_supported: bool | None = None,
+) -> None:
+    if plus_one_supported is not None:
+        decision["plus_one_supported"] = plus_one_supported
+    payload: JsonObject = {"decision": action}
+    if incident is not None:
+        payload["dedup_key"] = incident.get("dedup_key")
+        payload["announced"] = list(incident.get("announced") or [])
+    if outcome is not None:
+        payload["outcome"] = outcome.action
+        if outcome.id is not None:
+            payload["id"] = outcome.id
+    decision["incident"] = payload
+
+
+def _send_legacy_failure_notifications(
+    *,
+    notifier: CiWatchNotifier,
+    state: JsonObject,
+    failures: Mapping[str, FailureEvidence],
+    heads: Mapping[str, BranchHead],
+    action: str | None,
+    action_data: Mapping[str, str] | None,
+    now: datetime,
+    counters: dict[str, int],
+    decision: JsonObject,
+) -> list[str]:
+    errors: list[str] = []
+    raw_failures = state.get("failures")
+    failure_rows = raw_failures if isinstance(raw_failures, dict) else {}
+    for repo, row in failure_rows.items():
+        if (
+            not isinstance(repo, str)
+            or not isinstance(row, dict)
+            or row.get("notification_sent") is True
+            or repo not in failures
+        ):
+            continue
+        failure = failures[repo]
+        counters["notifications_attempted"] += 1
+        try:
+            notifier.notify(
+                _failure_notification_notes(repo, failure, heads.get(repo)),
+                icon="🚨",
+                tags=("ci", "failure"),
+                action=action,
+                action_data=action_data,
+            )
+        except CiWatchError as error:
+            counters["notifications_failed"] += 1
+            errors.append(str(error))
+            continue
+        counters["notifications_sent"] += 1
+        row["notification_sent"] = True
+        row["notified_at"] = now.isoformat()
+    _record_incident_decision(
+        decision,
+        action="legacy",
+        incident=None,
+        plus_one_supported=False,
+    )
+    return errors
+
+
+def _upsert_incident(
+    *,
+    notifier: CiWatchNotifier,
+    state: JsonObject,
+    failures: Mapping[str, FailureEvidence],
+    heads: Mapping[str, BranchHead],
+    failing_repos: Sequence[str],
+    previous: Mapping[str, Any] | None,
+    action: str | None,
+    action_data: Mapping[str, str] | None,
+    now: datetime,
+    counters: dict[str, int],
+    decision: JsonObject,
+) -> tuple[NotifyOutcome | None, list[str]]:
+    previous_announced = (
+        tuple(previous["announced"]) if previous is not None and "announced" in previous else ()
+    )
+    previous_sent = previous is not None and previous.get("notification_sent") is True
+    new_key = _incident_dedup_key(failing_repos)
+    supersedes: str | None = None
+    if previous is not None and previous_sent:
+        old_key = str(previous.get("dedup_key") or "")
+        if old_key and old_key != new_key:
+            supersedes = old_key
+    plus_one_note = _incident_create_plus_one_note(
+        failing_repos, previous_announced if previous_sent else ()
+    )
+    try:
+        outcome = notifier.notify_upsert(
+            _aggregate_failure_notes(failures, heads, failing_repos),
+            icon="🚨",
+            tags=("ci", "failure"),
+            dedup_key=new_key,
+            plus_one_note=plus_one_note,
+            supersedes=supersedes,
+            action=action,
+            action_data=action_data,
+        )
+    except CiWatchError as error:
+        counters["notifications_attempted"] += 1
+        counters["notifications_failed"] += 1
+        return None, [str(error)]
+    if outcome.unsupported:
+        return outcome, []
+    counters["notifications_attempted"] += 1
+    counters["notifications_sent"] += 1
+    remembered = _remember_incident(
+        state,
+        announced=failing_repos,
+        failures=failures,
+        sent=True,
+        now=now,
+    )
+    decision_name = (
+        "plus_oned" if outcome.action == "plus_oned" else "superseded" if supersedes else "created"
+    )
+    _record_incident_decision(
+        decision,
+        action=decision_name,
+        incident=remembered,
+        outcome=outcome,
+        plus_one_supported=True,
+    )
+    return outcome, []
+
+
+def _resolve_incident(
+    *,
+    notifier: CiWatchNotifier,
+    state: JsonObject,
+    incident: Mapping[str, Any] | None,
+    counters: dict[str, int],
+    decision: JsonObject,
+) -> list[str]:
+    if incident is None:
+        return []
+    if incident.get("notification_sent") is not True:
+        state["incident"] = None
+        decision["state_mutated"] = True
+        _record_incident_decision(decision, action="resolved", incident=incident)
+        return []
+    try:
+        outcome = notifier.notify_plus_one(
+            dedup_key=str(incident["dedup_key"]),
+            note=_incident_resolution_note(tuple(incident["announced"])),
+        )
+    except CiWatchError as error:
+        counters["notifications_attempted"] += 1
+        counters["notifications_failed"] += 1
+        return [str(error)]
+    if outcome.unsupported:
+        state["incident"] = None
+        decision["state_mutated"] = True
+        _record_incident_decision(
+            decision,
+            action="resolved",
+            incident=incident,
+            outcome=outcome,
+            plus_one_supported=False,
+        )
+        return []
+    counters["notifications_attempted"] += 1
+    if outcome.action != "no_match":
+        counters["notifications_sent"] += 1
+    else:
+        decision["state_mutated"] = True
+    state["incident"] = None
+    _record_incident_decision(
+        decision,
+        action="resolved",
+        incident=incident,
+        outcome=outcome,
+        plus_one_supported=True,
+    )
+    return []
+
+
+def _send_failure_notifications(
+    *,
+    notifier: CiWatchNotifier,
+    state: JsonObject,
+    failures: Mapping[str, FailureEvidence],
+    heads: Mapping[str, BranchHead],
+    action: str | None,
+    action_data: Mapping[str, str] | None,
+    now: datetime,
+    counters: dict[str, int],
+    decision: JsonObject,
+) -> list[str]:
+    failing_repos = tuple(sorted(failures))
+    incident_raw = state.get("incident")
+    incident = incident_raw if isinstance(incident_raw, dict) else None
+    if not failing_repos:
+        return _resolve_incident(
+            notifier=notifier,
+            state=state,
+            incident=incident,
+            counters=counters,
+            decision=decision,
+        )
+
+    announced = tuple(incident["announced"]) if incident is not None else ()
+    sent = incident is not None and incident.get("notification_sent") is True
+    if not sent or not set(failing_repos) <= set(announced):
+        outcome, errors = _upsert_incident(
+            notifier=notifier,
+            state=state,
+            failures=failures,
+            heads=heads,
+            failing_repos=failing_repos,
+            previous=incident,
+            action=action,
+            action_data=action_data,
+            now=now,
+            counters=counters,
+            decision=decision,
+        )
+        if outcome is not None and outcome.unsupported:
+            decision["plus_one_supported"] = False
+            errors.extend(
+                _send_legacy_failure_notifications(
+                    notifier=notifier,
+                    state=state,
+                    failures=failures,
+                    heads=heads,
+                    action=action,
+                    action_data=action_data,
+                    now=now,
+                    counters=counters,
+                    decision=decision,
+                )
+            )
+        return errors
+
+    assert incident is not None
+    described_raw = incident.get("described")
+    described_map = described_raw if isinstance(described_raw, dict) else {}
+    recovered = [repo for repo in announced if repo not in failures and repo in described_map]
+    re_failed = [repo for repo in failing_repos if repo in announced and repo not in described_map]
+    changed = [
+        repo
+        for repo in failing_repos
+        if repo in described_map and described_map.get(repo) != failures[repo].fingerprint_key
+    ]
+    if not recovered and not re_failed and not changed:
+        _record_incident_decision(
+            decision,
+            action="silence",
+            incident=incident,
+            plus_one_supported=True,
+        )
+        return []
+
+    note = _incident_delta_note(
+        recovered=recovered,
+        re_failed=re_failed,
+        changed=changed,
+        failures=failures,
+    )
+    try:
+        outcome = notifier.notify_plus_one(dedup_key=str(incident["dedup_key"]), note=note)
+    except CiWatchError as error:
+        counters["notifications_attempted"] += 1
+        counters["notifications_failed"] += 1
+        return [str(error)]
+    if outcome.unsupported:
+        decision["plus_one_supported"] = False
+        return _send_legacy_failure_notifications(
+            notifier=notifier,
+            state=state,
+            failures=failures,
+            heads=heads,
+            action=action,
+            action_data=action_data,
+            now=now,
+            counters=counters,
+            decision=decision,
+        )
+    if outcome.action == "no_match":
+        outcome, errors = _upsert_incident(
+            notifier=notifier,
+            state=state,
+            failures=failures,
+            heads=heads,
+            failing_repos=failing_repos,
+            previous=None,
+            action=action,
+            action_data=action_data,
+            now=now,
+            counters=counters,
+            decision=decision,
+        )
+        if outcome is not None and outcome.unsupported:
+            decision["plus_one_supported"] = False
+            errors.extend(
+                _send_legacy_failure_notifications(
+                    notifier=notifier,
+                    state=state,
+                    failures=failures,
+                    heads=heads,
+                    action=action,
+                    action_data=action_data,
+                    now=now,
+                    counters=counters,
+                    decision=decision,
+                )
+            )
+        return errors
+    counters["notifications_attempted"] += 1
+    counters["notifications_sent"] += 1
+    remembered = _remember_incident(
+        state,
+        announced=announced,
+        failures=failures,
+        sent=True,
+        now=now,
+        described={repo: failures[repo].fingerprint_key for repo in failing_repos},
+    )
+    _record_incident_decision(
+        decision,
+        action="plus_oned",
+        incident=remembered,
+        outcome=outcome,
+        plus_one_supported=True,
+    )
+    return []
+
+
 def _update_failure_state(
     state: JsonObject,
     failures: Mapping[str, FailureEvidence],
@@ -1968,19 +2623,16 @@ def _append_release_record(
     raw_releases[:] = raw_releases[-MAX_STATE_RELEASES:]
 
 
-def _send_required_notifications(
+def _send_release_notifications(
     *,
-    invocation: ChopInvocation,
-    notifier: SaseNotifier,
+    notifier: CiWatchNotifier,
     state: JsonObject,
-    failures: Mapping[str, FailureEvidence],
-    heads: Mapping[str, BranchHead],
-    report_path: Path | None,
+    action: str | None,
+    action_data: Mapping[str, str] | None,
     now: datetime,
     counters: dict[str, int],
 ) -> list[str]:
     errors: list[str] = []
-    action, action_data = _notification_action(report_path)
     raw_releases = state.get("releases")
     releases = raw_releases if isinstance(raw_releases, list) else []
     for row in releases:
@@ -2002,36 +2654,47 @@ def _send_required_notifications(
         counters["notifications_sent"] += 1
         row["notification_sent"] = True
         row["notified_at"] = now.isoformat()
+    return errors
 
-    raw_failures = state.get("failures")
-    failure_rows = raw_failures if isinstance(raw_failures, dict) else {}
-    for repo, row in failure_rows.items():
-        if (
-            not isinstance(repo, str)
-            or not isinstance(row, dict)
-            or row.get("notification_sent") is True
-            or repo not in failures
-        ):
-            continue
-        failure = failures[repo]
-        counters["notifications_attempted"] += 1
-        try:
-            notifier.notify(
-                _failure_notification_notes(repo, failure, heads.get(repo)),
-                icon="🚨",
-                tags=("ci", "failure"),
-                action=action,
-                action_data=action_data,
-            )
-        except CiWatchError as error:
-            counters["notifications_failed"] += 1
-            errors.append(str(error))
-            continue
-        counters["notifications_sent"] += 1
-        row["notification_sent"] = True
-        row["notified_at"] = now.isoformat()
 
-    if counters["notifications_sent"]:
+def _send_required_notifications(
+    *,
+    invocation: ChopInvocation,
+    notifier: CiWatchNotifier,
+    state: JsonObject,
+    failures: Mapping[str, FailureEvidence],
+    heads: Mapping[str, BranchHead],
+    report_path: Path | None,
+    now: datetime,
+    counters: dict[str, int],
+    decision: JsonObject,
+) -> list[str]:
+    errors: list[str] = []
+    action, action_data = _notification_action(report_path)
+    errors.extend(
+        _send_release_notifications(
+            notifier=notifier,
+            state=state,
+            action=action,
+            action_data=action_data,
+            now=now,
+            counters=counters,
+        )
+    )
+    errors.extend(
+        _send_failure_notifications(
+            notifier=notifier,
+            state=state,
+            failures=failures,
+            heads=heads,
+            action=action,
+            action_data=action_data,
+            now=now,
+            counters=counters,
+            decision=decision,
+        )
+    )
+    if counters["notifications_sent"] or decision.get("state_mutated") is True:
         try:
             _write_state(invocation, state)
         except OSError as error:
@@ -2079,7 +2742,7 @@ def build_ci_watch_result(
     *,
     actstat: ActstatClient | None = None,
     github: GitHubReader | None = None,
-    notifier: SaseNotifier | None = None,
+    notifier: CiWatchNotifier | None = None,
     clock: Callable[[], datetime] = _local_now,
 ) -> ChopResultBuilder:
     config = Config.from_invocation(invocation)
@@ -2401,6 +3064,7 @@ def build_ci_watch_result(
             operational_errors.append(f"report publish failed: {_bounded(error)}")
 
     state_write_failed = any(error.startswith("state write failed") for error in operational_errors)
+    notification_decision: JsonObject = {}
     if mode == "live" and not state_write_failed:
         operational_errors.extend(
             _send_required_notifications(
@@ -2412,6 +3076,7 @@ def build_ci_watch_result(
                 report_path=report_path,
                 now=now,
                 counters=counters,
+                decision=notification_decision,
             )
         )
 
@@ -2448,6 +3113,10 @@ def build_ci_watch_result(
         ],
         "notification_errors": operational_errors,
     }
+    if "plus_one_supported" in notification_decision:
+        ledger["plus_one_supported"] = notification_decision["plus_one_supported"]
+    if "incident" in notification_decision:
+        ledger["incident"] = notification_decision["incident"]
     result.add_evidence(_write_ledger(invocation, ledger))
     return result
 
@@ -2456,14 +3125,14 @@ def main() -> None:
     run_chop(
         CHOP_NAME,
         """\
-Sweep SASE CI, send durable per-incident notifications, and guard release-please
-merges.
+Sweep SASE CI, send durable incident-combination notifications, and guard
+release-please merges.
 
 The chop never creates gates, launches agents, or emits repair proposals. It may
 only query actstat and GitHub, merge an explicitly eligible release-please PR
 using the configured merge method in live mode, publish the combined CI WATCH
-report, and call `sase notify create` for required release or failure
-notifications.
+report, and call `sase notify create` or `sase notify +1` for required release
+or failure notifications.
 """.strip(),
         build_ci_watch_result,
     )

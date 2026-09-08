@@ -28,6 +28,7 @@ from bugyi_chops.ci_watch import (
     GitHubReader,
     HeadCiEvidence,
     MergePlan,
+    NotifyOutcome,
     ReleasePr,
     ReleaseSettings,
     RepoObservation,
@@ -297,9 +298,21 @@ class FakeGitHub:
 
 
 class FakeNotifier:
-    def __init__(self, *, fail_count: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        fail_count: int = 0,
+        plus_one_supported: bool = True,
+        upsert_actions: Sequence[str] | None = None,
+        plus_one_actions: Sequence[str] | None = None,
+    ) -> None:
         self.fail_count = fail_count
+        self.plus_one_supported = plus_one_supported
+        self.upsert_actions = list(upsert_actions or [])
+        self.plus_one_actions = list(plus_one_actions or [])
         self.notifications: list[dict[str, Any]] = []
+        self.upserts: list[dict[str, Any]] = []
+        self.plus_ones: list[dict[str, Any]] = []
 
     def notify(
         self,
@@ -322,6 +335,57 @@ class FakeNotifier:
         if self.fail_count > 0:
             self.fail_count -= 1
             raise CiWatchError("notification failed: synthetic")
+
+    def notify_upsert(
+        self,
+        notes: Sequence[str],
+        *,
+        icon: str,
+        tags: Sequence[str],
+        dedup_key: str,
+        plus_one_note: str,
+        supersedes: str | None = None,
+        action: str | None = None,
+        action_data: Mapping[str, str] | None = None,
+    ) -> NotifyOutcome:
+        self.upserts.append(
+            {
+                "notes": list(notes),
+                "icon": icon,
+                "tags": list(tags),
+                "action": action,
+                "action_data": dict(action_data) if action_data is not None else None,
+                "dedup_key": dedup_key,
+                "plus_one_note": plus_one_note,
+                "supersedes": supersedes,
+            }
+        )
+        if not self.plus_one_supported:
+            return NotifyOutcome(action="unsupported", unsupported=True)
+        self.notifications.append(
+            {
+                "notes": list(notes),
+                "icon": icon,
+                "tags": list(tags),
+                "action": action,
+                "action_data": dict(action_data) if action_data is not None else None,
+            }
+        )
+        if self.fail_count > 0:
+            self.fail_count -= 1
+            raise CiWatchError("notification failed: synthetic")
+        action_name = self.upsert_actions.pop(0) if self.upsert_actions else "created"
+        return NotifyOutcome(action=action_name, id="fake-notification")
+
+    def notify_plus_one(self, *, dedup_key: str, note: str) -> NotifyOutcome:
+        self.plus_ones.append({"dedup_key": dedup_key, "note": note})
+        if not self.plus_one_supported:
+            return NotifyOutcome(action="unsupported", unsupported=True)
+        if self.fail_count > 0:
+            self.fail_count -= 1
+            raise CiWatchError("notification failed: synthetic")
+        action_name = self.plus_one_actions.pop(0) if self.plus_one_actions else "plus_oned"
+        return NotifyOutcome(action=action_name, id="fake-notification")
 
 
 def _vars(
@@ -381,7 +445,7 @@ def _build(
         _invocation(tmp_path, variables or _vars(), result_file=result_file),
         actstat=FakeActstat(observations),  # type: ignore[arg-type]
         github=github,  # type: ignore[arg-type]
-        notifier=notifier,  # type: ignore[arg-type]
+        notifier=notifier,
         **({"clock": clock} if clock is not None else {}),
     ).to_dict()
     evidence = result["evidence"]
@@ -457,13 +521,19 @@ def test_live_red_repository_sends_actionable_notification_and_report(
     assert notification["action_data"]["report_path"] == str(
         (tmp_path / REPORT_FILE_NAME).resolve()
     )
-    assert notification["notes"][0] == f"CI failure: {REPO} master@{SHA[:12]}"
+    assert notification["notes"][0] == f"CI failure: {REPO}"
+    assert f"CI failure: {REPO} master@{SHA[:12]}" in notification["notes"]
     assert "CI › test [redacted] — failure" in notification["notes"]
     assert "Steps: Run tests" in notification["notes"]
     assert "token=do-not-leak" not in json.dumps(notification)
 
     state = _state(tmp_path)
     assert state["failures"][REPO]["notification_sent"] is True
+    assert state["incident"]["dedup_key"] == f"ci-failure/{REPO}"
+    assert state["incident"]["announced"] == [REPO]
+    assert state["incident"]["notification_sent"] is True
+    assert ledger["incident"]["decision"] == "created"
+    assert ledger["plus_one_supported"] is True
     report = _report(tmp_path)
     failure_rows = _rows(report, ["REPOSITORY", "SHA", "JOB", "STEPS", "URL"])
     assert any(
@@ -473,7 +543,7 @@ def test_live_red_repository_sends_actionable_notification_and_report(
     validate_chop_result(result)
 
 
-def test_multiple_red_repositories_and_jobs_each_notify_once(
+def test_multiple_red_repositories_combine_into_one_notification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -496,19 +566,21 @@ def test_multiple_red_repositories_and_jobs_each_notify_once(
         ),
     )
 
-    result, _, _, notifier = _build(tmp_path, observations, clock=_clock_at())
+    result, ledger, _, notifier = _build(tmp_path, observations, clock=_clock_at())
 
     assert result["counters"]["red"] == 2
-    assert result["counters"]["notifications_sent"] == 2
-    assert [item["tags"] for item in notifier.notifications] == [
-        ["ci", "failure"],
-        ["ci", "failure"],
-    ]
+    assert result["counters"]["notifications_sent"] == 1
+    assert [item["tags"] for item in notifier.notifications] == [["ci", "failure"]]
     first = notifier.notifications[0]
+    assert first["notes"][0] == "CI failure: sase, sase-core"
     assert "CI › lint — failure" in first["notes"]
     assert "CI › test — failure" in first["notes"]
     assert "Steps: ruff" in first["notes"]
     assert "Steps: pytest" in first["notes"]
+    assert notifier.upserts[0]["dedup_key"] == f"ci-failure/{REPO},{CORE}"
+    assert notifier.upserts[0]["supersedes"] is None
+    assert ledger["incident"]["decision"] == "created"
+    assert _state(tmp_path)["incident"]["announced"] == [REPO, CORE]
 
 
 def test_failure_incident_dedupes_changes_resets_and_retries(
@@ -527,20 +599,24 @@ def test_failure_incident_dedupes_changes_resets_and_retries(
         clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
     )
     assert len(notifier.notifications) == 1
+    assert notifier.plus_ones == []
 
     changed = _observations(red=(REPO,))
     changed[REPO] = RepoObservation(
         REPO,
         commit=_commit(REPO, SHA, "failure", jobs=[_job("test", steps=("different",))]),
     )
-    _build(
+    _, changed_ledger, _, notifier = _build(
         tmp_path,
         changed,
         notifier=notifier,
         result_file="changed.json",
         clock=_clock_at(FIXED_NOW + timedelta(minutes=10)),
     )
-    assert len(notifier.notifications) == 2
+    assert len(notifier.notifications) == 1
+    assert len(notifier.plus_ones) == 1
+    assert changed_ledger["incident"]["decision"] == "plus_oned"
+    assert "evidence changed" in notifier.plus_ones[0]["note"]
 
     _build(
         tmp_path,
@@ -550,6 +626,9 @@ def test_failure_incident_dedupes_changes_resets_and_retries(
         clock=_clock_at(FIXED_NOW + timedelta(minutes=15)),
     )
     assert _state(tmp_path)["failures"] == {}
+    assert _state(tmp_path)["incident"] is None
+    assert len(notifier.plus_ones) == 2
+    assert notifier.plus_ones[-1]["note"].startswith("all green:")
     _build(
         tmp_path,
         failing,
@@ -557,7 +636,8 @@ def test_failure_incident_dedupes_changes_resets_and_retries(
         result_file="recurs.json",
         clock=_clock_at(FIXED_NOW + timedelta(minutes=20)),
     )
-    assert len(notifier.notifications) == 3
+    assert len(notifier.notifications) == 2
+    assert len(notifier.upserts) == 2
 
     retry_path = tmp_path / "retry"
     retry_notifier = FakeNotifier(fail_count=1)
@@ -571,6 +651,7 @@ def test_failure_incident_dedupes_changes_resets_and_retries(
     assert failed["status"] == "check_error"
     assert failed["reason"] == "notification_failed"
     assert _state(retry_path)["failures"][REPO]["notification_sent"] is False
+    assert _state(retry_path).get("incident") is None
     ok, _, _, retry_notifier = _build(
         retry_path,
         failing,
@@ -581,6 +662,7 @@ def test_failure_incident_dedupes_changes_resets_and_retries(
     assert ok["status"] == "ok"
     assert len(retry_notifier.notifications) == 2
     assert _state(retry_path)["failures"][REPO]["notification_sent"] is True
+    assert _state(retry_path)["incident"]["notification_sent"] is True
 
 
 def test_older_settled_failure_remains_visible_while_head_is_unsettled(
@@ -2188,6 +2270,98 @@ def test_sase_notifier_only_calls_notify_create_and_fails_explicitly() -> None:
         failing.notify(["hi"], icon="🚨", tags=["ci"])
 
 
+def test_sase_notifier_upsert_and_plus_one_wire_contract() -> None:
+    created = QueueRunner(CommandResult(0, '{"action":"created","id":"n1"}'))
+    notifier = SaseNotifier("/sase", created)
+    outcome = notifier.notify_upsert(
+        ["CI failure: sase, sase-core"],
+        icon="🚨",
+        tags=["ci", "failure"],
+        dedup_key=f"ci-failure/{CORE},{REPO}",
+        plus_one_note="sase-core started failing; still failing: sase",
+        supersedes=f"ci-failure/{REPO}",
+        action="ViewReport",
+        action_data={"report_path": "/tmp/report.json"},
+    )
+    argv, payload, cwd = created.calls[0]
+    assert argv == [
+        "/sase",
+        "notify",
+        "create",
+        "-s",
+        "ci_watch",
+        "-k",
+        f"ci-failure/{CORE},{REPO}",
+        "-p",
+        "sase-core started failing; still failing: sase",
+        "-S",
+        f"ci-failure/{REPO}",
+    ]
+    assert cwd is None
+    assert json.loads(payload or "{}")["notes"][0] == "CI failure: sase, sase-core"
+    assert outcome == NotifyOutcome(action="created", id="n1")
+
+    plus = QueueRunner(CommandResult(0, '{"action":"plus_oned","id":"n1"}'))
+    plus_outcome = SaseNotifier("/sase", plus).notify_plus_one(
+        dedup_key=f"ci-failure/{REPO}",
+        note="all green: sase-org/sase",
+    )
+    assert plus.calls[0][0] == [
+        "/sase",
+        "notify",
+        "+1",
+        "-s",
+        "ci_watch",
+        "-k",
+        f"ci-failure/{REPO}",
+        "all green: sase-org/sase",
+    ]
+    assert plus_outcome == NotifyOutcome(action="plus_oned", id="n1")
+
+    unrecognized = SaseNotifier(
+        "/sase",
+        QueueRunner(
+            CommandResult(
+                2,
+                stderr="sase notify create: error: unrecognized arguments: -k",
+            )
+        ),
+    )
+    assert unrecognized.notify_upsert(
+        ["n"],
+        icon="🚨",
+        tags=["ci"],
+        dedup_key="ci-failure/x",
+        plus_one_note="n",
+    ) == NotifyOutcome(action="unsupported", unsupported=True)
+
+    invalid_choice = SaseNotifier(
+        "/sase",
+        QueueRunner(
+            CommandResult(
+                2,
+                stderr="sase notify: error: argument notify_subcommand: invalid choice: '+1'",
+            )
+        ),
+    )
+    assert invalid_choice.notify_plus_one(
+        dedup_key="ci-failure/x", note="all green: x"
+    ) == NotifyOutcome(action="unsupported", unsupported=True)
+
+    with pytest.raises(CiWatchError, match="notification failed"):
+        SaseNotifier("/sase", QueueRunner(CommandResult(1, stderr="boom"))).notify_plus_one(
+            dedup_key="ci-failure/x", note="n"
+        )
+    with pytest.raises(CiWatchError, match="empty outcome"):
+        SaseNotifier("/sase", QueueRunner(CommandResult(0, "\n"))).notify_plus_one(
+            dedup_key="ci-failure/x", note="n"
+        )
+    bare = SaseNotifier("/sase", QueueRunner(CommandResult(0, "bare-id\n")))
+    assert bare.notify_upsert(
+        ["n"], icon="🚨", tags=["ci"], dedup_key="k", plus_one_note="n"
+    ) == NotifyOutcome(action="created", id="bare-id")
+
+
 def test_default_command_runner_captures_output_and_exec_errors() -> None:
     result = run_command(["sh", "-c", "read value; printf '%s' \"$value\""], input_text="ok\n")
     assert result == CommandResult(0, "ok", "")
@@ -2196,12 +2370,25 @@ def test_default_command_runner_captures_output_and_exec_errors() -> None:
 
 
 def test_subprocess_boundary_contains_no_sase_agent_launch_gate_or_run_paths() -> None:
-    runner = QueueRunner(CommandResult(0, "id"))
+    runner = QueueRunner(
+        CommandResult(0, "id"),
+        CommandResult(0, '{"action":"created","id":"n1"}'),
+        CommandResult(0, '{"action":"plus_oned","id":"n1"}'),
+    )
     notifier = SaseNotifier("/sase", runner)
     notifier.notify(["failure"], icon="🚨", tags=["ci"])
-    argv = runner.calls[0][0]
-    assert argv[:3] == ["/sase", "notify", "create"]
-    assert not any(part in {"agent", "launch", "gate", "run"} for part in argv)
+    notifier.notify_upsert(
+        ["failure"],
+        icon="🚨",
+        tags=["ci"],
+        dedup_key=f"ci-failure/{REPO}",
+        plus_one_note="CI failure: sase-org/sase",
+    )
+    notifier.notify_plus_one(dedup_key=f"ci-failure/{REPO}", note="all green: sase-org/sase")
+    for argv, _, _ in runner.calls:
+        assert argv[:2] == ["/sase", "notify"]
+        assert argv[2] in {"create", "+1"}
+        assert not any(part in {"agent", "launch", "gate", "run"} for part in argv)
 
 
 def test_release_observation_errors_detail_cap_and_generator_error(
@@ -2306,13 +2493,14 @@ def test_notification_state_write_failure_after_success(
     counters = ci_watch_module._new_counters(1)
     errors = ci_watch_module._send_required_notifications(
         invocation=_invocation(tmp_path, _vars()),
-        notifier=FakeNotifier(),  # type: ignore[arg-type]
+        notifier=FakeNotifier(),
         state=state,
         failures={REPO: ci_watch_module.FailureEvidence(SHA, (_failure_job("lint"),))},
         heads={},
         report_path=None,
         now=FIXED_NOW,
         counters=counters,
+        decision={},
     )
     assert counters["notifications_sent"] == 1
     assert errors == ["state write failed after notification: disk full"]
@@ -2334,3 +2522,448 @@ def test_main_check_error_still_emits_valid_report(
     assert result["report"]["title"] == "CI WATCH"
     assert result["report"]["blocks"][0]["tone"] == "error"
     validate_chop_result(result)
+
+
+def test_new_repo_rolls_incident_with_supersede(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    notifier = FakeNotifier()
+    _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        notifier=notifier,
+        result_file="first.json",
+        clock=_clock_at(),
+    )
+    _, ledger, _, notifier = _build(
+        tmp_path,
+        _observations(red=(REPO, CORE)),
+        notifier=notifier,
+        result_file="roll.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert len(notifier.notifications) == 2
+    assert notifier.upserts[1]["dedup_key"] == f"ci-failure/{REPO},{CORE}"
+    assert notifier.upserts[1]["supersedes"] == f"ci-failure/{REPO}"
+    assert "started failing" in notifier.upserts[1]["plus_one_note"]
+    assert ledger["incident"]["decision"] == "superseded"
+    assert _state(tmp_path)["incident"]["announced"] == [REPO, CORE]
+
+
+def test_recovery_and_re_failure_within_announced_plus_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    notifier = FakeNotifier()
+    _build(
+        tmp_path,
+        _observations(red=(REPO, CORE)),
+        notifier=notifier,
+        result_file="both.json",
+        clock=_clock_at(),
+    )
+    _, recovered_ledger, _, notifier = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        notifier=notifier,
+        result_file="recovered.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert len(notifier.notifications) == 1
+    assert recovered_ledger["incident"]["decision"] == "plus_oned"
+    assert notifier.plus_ones[0]["note"] == f"{CORE} recovered"
+    assert _state(tmp_path)["incident"]["announced"] == [REPO, CORE]
+    assert CORE not in _state(tmp_path)["incident"]["described"]
+
+    _, refailed_ledger, _, notifier = _build(
+        tmp_path,
+        _observations(red=(REPO, CORE)),
+        notifier=notifier,
+        result_file="refailed.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=10)),
+    )
+    assert refailed_ledger["incident"]["decision"] == "plus_oned"
+    assert "re-failed" in notifier.plus_ones[1]["note"]
+    assert CORE in _state(tmp_path)["incident"]["described"]
+
+
+def test_state_loss_adopts_plus_oned_create_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    notifier = FakeNotifier()
+    _build(
+        tmp_path,
+        _observations(red=(REPO, CORE)),
+        notifier=notifier,
+        result_file="first.json",
+        clock=_clock_at(),
+    )
+    (tmp_path / STATE_FILE_NAME).unlink()
+    notifier.upsert_actions = ["plus_oned"]
+    _, ledger, _, notifier = _build(
+        tmp_path,
+        _observations(red=(REPO, CORE)),
+        notifier=notifier,
+        result_file="lost.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert ledger["incident"]["decision"] == "plus_oned"
+    assert ledger["incident"]["outcome"] == "plus_oned"
+    assert len(notifier.notifications) == 2
+    assert _state(tmp_path)["incident"]["notification_sent"] is True
+    assert _state(tmp_path)["incident"]["dedup_key"] == f"ci-failure/{REPO},{CORE}"
+
+
+def test_v1_sent_failures_migrate_to_incident_without_reannounce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    failure = ci_watch_module.FailureEvidence(SHA, (_failure_job("test token=do-not-leak"),))
+    (tmp_path / STATE_FILE_NAME).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "failures": {
+                    REPO: {
+                        "fingerprint": failure.fingerprint_key,
+                        "notification_sent": True,
+                        "last_seen": FIXED_NOW.isoformat(),
+                        "evidence": ci_watch_module._failure_to_json(failure),
+                    }
+                },
+                "releases": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    result, ledger, _, notifier = _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert result["counters"]["notifications_sent"] == 0
+    assert notifier.notifications == []
+    assert notifier.plus_ones == []
+    assert ledger["incident"]["decision"] == "silence"
+    state = _state(tmp_path)
+    assert state["version"] == 2
+    assert state["incident"]["dedup_key"] == f"ci-failure/{REPO}"
+    assert state["incident"]["announced"] == [REPO]
+
+
+def test_delta_plus_one_unsupported_falls_back_to_legacy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    notifier = FakeNotifier()
+    _build(
+        tmp_path,
+        _observations(red=(REPO,)),
+        notifier=notifier,
+        result_file="first.json",
+        clock=_clock_at(),
+    )
+    notifier.plus_one_supported = False
+    changed = _observations(red=(REPO,))
+    changed[REPO] = RepoObservation(
+        REPO,
+        commit=_commit(REPO, SHA, "failure", jobs=[_job("test", steps=("different",))]),
+    )
+    result, ledger, _, notifier = _build(
+        tmp_path,
+        changed,
+        notifier=notifier,
+        result_file="fallback.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert result["counters"]["notifications_failed"] == 0
+    assert result["counters"]["notifications_sent"] == 1
+    assert ledger["plus_one_supported"] is False
+    assert ledger["incident"]["decision"] == "legacy"
+    assert len(notifier.notifications) == 2
+
+
+def test_capability_fallback_uses_legacy_per_repo_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    notifier = FakeNotifier(plus_one_supported=False)
+    result, ledger, _, notifier = _build(
+        tmp_path,
+        _observations(red=(REPO, CORE)),
+        notifier=notifier,
+        clock=_clock_at(),
+    )
+    assert result["counters"]["notifications_sent"] == 2
+    assert result["counters"]["notifications_failed"] == 0
+    assert ledger["plus_one_supported"] is False
+    assert ledger["incident"]["decision"] == "legacy"
+    assert [item["tags"] for item in notifier.notifications] == [
+        ["ci", "failure"],
+        ["ci", "failure"],
+    ]
+    assert notifier.upserts[0]["dedup_key"] == f"ci-failure/{REPO},{CORE}"
+    assert _state(tmp_path)["failures"][REPO]["notification_sent"] is True
+    assert _state(tmp_path)["failures"][CORE]["notification_sent"] is True
+
+
+def test_three_repo_title_includes_count_suffix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    _, _, _, notifier = _build(
+        tmp_path,
+        _observations(red=(REPO, CORE, TELEGRAM)),
+        clock=_clock_at(),
+    )
+    assert (
+        notifier.notifications[0]["notes"][0]
+        == "CI failure: sase, sase-core, sase-telegram (3 repos)"
+    )
+
+
+def test_incident_delta_plus_one_retries_after_send_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    notifier = FakeNotifier()
+    failing = _observations(red=(REPO,))
+    _build(tmp_path, failing, notifier=notifier, result_file="first.json", clock=_clock_at())
+    original = _state(tmp_path)["incident"]["described"][REPO]
+    notifier.fail_count = 1
+    changed = _observations(red=(REPO,))
+    changed[REPO] = RepoObservation(
+        REPO,
+        commit=_commit(REPO, SHA, "failure", jobs=[_job("test", steps=("different",))]),
+    )
+    failed, _, _, notifier = _build(
+        tmp_path,
+        changed,
+        notifier=notifier,
+        result_file="fail.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert failed["status"] == "check_error"
+    assert _state(tmp_path)["incident"]["described"][REPO] == original
+    ok, ledger, _, notifier = _build(
+        tmp_path,
+        changed,
+        notifier=notifier,
+        result_file="retry.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=10)),
+    )
+    assert ok["status"] == "ok"
+    assert ledger["incident"]["decision"] == "plus_oned"
+    assert _state(tmp_path)["incident"]["described"][REPO] != original
+
+
+def test_incident_helpers_sanitize_compact_and_delta_notes() -> None:
+    assert ci_watch_module._compact_repo_names([REPO]) == REPO
+    assert ci_watch_module._compact_repo_names([REPO, CORE]) == "sase, sase-core"
+    assert (
+        ci_watch_module._compact_repo_names([REPO, CORE, TELEGRAM])
+        == "sase, sase-core, sase-telegram (3 repos)"
+    )
+    assert ci_watch_module._compact_repo_names([REPO, "other/sase"]) == f"{REPO}, other/sase"
+    failure = ci_watch_module.FailureEvidence(
+        SHA, (_failure_job("lint"), _failure_job("test"), _failure_job("typecheck"))
+    )
+    assert ci_watch_module._delta_job_hint(failure) == "CI › lint (3)"
+    note = ci_watch_module._incident_delta_note(
+        recovered=(CORE,),
+        re_failed=(TELEGRAM,),
+        changed=(REPO,),
+        failures={
+            REPO: failure,
+            TELEGRAM: ci_watch_module.FailureEvidence(TELEGRAM_SHA, (_failure_job("job"),)),
+        },
+    )
+    assert note == (
+        f"{CORE} recovered; {TELEGRAM} re-failed (CI › job); "
+        f"{REPO}: evidence changed (CI › lint (3))"
+    )
+    assert ci_watch_module._sanitize_incident("bad", {REPO}) is None
+    assert ci_watch_module._sanitize_incident({"announced": [REPO]}, {REPO}) is None
+    sanitized = ci_watch_module._sanitize_incident(
+        {
+            "announced": [CORE, REPO, REPO, "bad repo", "other/skip"],
+            "notification_sent": True,
+            "described": {REPO: "a" * 16, CORE: "not-hex", "skip": "b" * 16},
+            "notified_at": "not-a-date",
+        },
+        {REPO, CORE},
+    )
+    assert sanitized is not None
+    assert sanitized["announced"] == [REPO, CORE]
+    assert sanitized["dedup_key"] == f"ci-failure/{REPO},{CORE}"
+    assert sanitized["described"] == {REPO: "a" * 16}
+    assert "notified_at" not in sanitized
+
+
+def test_plus_one_no_match_recreates_incident(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    notifier = FakeNotifier()
+    failing = _observations(red=(REPO,))
+    _build(tmp_path, failing, notifier=notifier, result_file="first.json", clock=_clock_at())
+    notifier.plus_one_actions = ["no_match"]
+    changed = _observations(red=(REPO,))
+    changed[REPO] = RepoObservation(
+        REPO,
+        commit=_commit(REPO, SHA, "failure", jobs=[_job("test", steps=("different",))]),
+    )
+    _, ledger, _, notifier = _build(
+        tmp_path,
+        changed,
+        notifier=notifier,
+        result_file="recreate.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert ledger["incident"]["decision"] == "created"
+    assert len(notifier.upserts) == 2
+    assert len(notifier.plus_ones) == 1
+
+
+def test_incident_combination_end_to_end_queue_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    runner = QueueRunner(CommandResult(0, '{"action":"created","id":"n1"}'))
+    notifier = SaseNotifier("/sase", runner)
+    invocation = _invocation(tmp_path, _vars())
+    result = build_ci_watch_result(
+        invocation,
+        actstat=FakeActstat(_observations(red=(REPO, CORE))),  # type: ignore[arg-type]
+        github=FakeGitHub(),  # type: ignore[arg-type]
+        notifier=notifier,
+        clock=_clock_at(),
+    ).to_dict()
+    evidence = result["evidence"]
+    assert isinstance(evidence, list)
+    ledger = json.loads((tmp_path / cast(str, evidence[0])).read_text(encoding="utf-8"))
+    argv, payload, _ = runner.calls[0]
+    assert argv[:6] == ["/sase", "notify", "create", "-s", "ci_watch", "-k"]
+    assert argv[6] == f"ci-failure/{REPO},{CORE}"
+    assert "-p" in argv
+    assert "-S" not in argv
+    body = json.loads(payload or "{}")
+    assert body["notes"][0] == "CI failure: sase, sase-core"
+    assert body["tags"] == ["ci", "failure"]
+    assert body["icon"] == "🚨"
+    assert body["action"] == "ViewReport"
+    assert ledger["incident"]["decision"] == "created"
+    assert ledger["incident"]["id"] == "n1"
+
+
+def test_resolution_no_match_and_unsupported_clear_incident(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    notifier = FakeNotifier()
+    _build(
+        tmp_path / "no-match",
+        _observations(red=(REPO,)),
+        notifier=notifier,
+        result_file="first.json",
+        clock=_clock_at(),
+    )
+    notifier.plus_one_actions = ["no_match"]
+    result, ledger, _, notifier = _build(
+        tmp_path / "no-match",
+        _observations(),
+        notifier=notifier,
+        result_file="green.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert result["counters"]["notifications_sent"] == 0
+    assert ledger["incident"]["decision"] == "resolved"
+    assert ledger["incident"]["outcome"] == "no_match"
+    assert _state(tmp_path / "no-match")["incident"] is None
+
+    unsupported = FakeNotifier()
+    _build(
+        tmp_path / "unsupported",
+        _observations(red=(REPO,)),
+        notifier=unsupported,
+        result_file="first.json",
+        clock=_clock_at(),
+    )
+    unsupported.plus_one_supported = False
+    _, unsupported_ledger, _, unsupported = _build(
+        tmp_path / "unsupported",
+        _observations(),
+        notifier=unsupported,
+        result_file="green.json",
+        clock=_clock_at(FIXED_NOW + timedelta(minutes=5)),
+    )
+    assert unsupported_ledger["plus_one_supported"] is False
+    assert unsupported_ledger["incident"]["decision"] == "resolved"
+    assert _state(tmp_path / "unsupported")["incident"] is None
+    assert unsupported.notifications  # original create only; no legacy failure pings
+
+
+def test_unsent_incident_clears_on_green_without_plus_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SASE_CHOP_DRY_RUN", "0")
+    state = {
+        "version": 2,
+        "failures": {},
+        "releases": [],
+        "incident": {
+            "dedup_key": f"ci-failure/{REPO}",
+            "announced": [REPO],
+            "notification_sent": False,
+            "described": {},
+        },
+    }
+    (tmp_path / STATE_FILE_NAME).write_text(json.dumps(state), encoding="utf-8")
+    notifier = FakeNotifier()
+    _, ledger, _, notifier = _build(
+        tmp_path,
+        _observations(),
+        notifier=notifier,
+        clock=_clock_at(),
+    )
+    assert notifier.plus_ones == []
+    assert ledger["incident"]["decision"] == "resolved"
+    assert _state(tmp_path)["incident"] is None
+
+
+def test_incident_create_note_and_empty_delta_hint() -> None:
+    assert (
+        ci_watch_module._incident_create_plus_one_note((REPO, CORE), ())
+        == "CI failure: sase, sase-core"
+    )
+    assert (
+        ci_watch_module._incident_create_plus_one_note((REPO, CORE), (REPO,))
+        == f"{CORE} started failing; still failing: {REPO}"
+    )
+    assert ci_watch_module._delta_job_hint(ci_watch_module.FailureEvidence(SHA, ())) == "jobs"
+    loaded = ci_watch_module._sanitize_incident(
+        {
+            "announced": [REPO],
+            "notification_sent": False,
+            "described": {REPO: "ab" * 8},
+            "notified_at": FIXED_NOW.isoformat(),
+        },
+        {REPO},
+    )
+    assert loaded is not None
+    assert loaded["notified_at"] == FIXED_NOW.isoformat()
+    assert loaded["notification_sent"] is False
