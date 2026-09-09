@@ -57,16 +57,19 @@ MISSION_LINES = [
 def _parse_condition_prompt(prompt: str, path: str, floor: int) -> tuple[str, str]:
     assert prompt.count("%if::") == 1
     assert prompt.count("```bash") == 1
-    assert prompt.endswith(f"%auto %queue(priority=20) #split_file:{path}")
+    assert prompt.endswith(f"%auto #split_file:{path}")
     with override_flags(typed_launch_units=True):
         cleaned, directives = extract_prompt_directives(prompt)
     assert directives.if_code is not None
     assert directives.if_code.language == "bash"
+    assert directives.wait_priority is None
+    assert directives.wait_runners is None
     body = directives.if_code.source
     assert f"path={shlex.quote(path)}" in body
     assert f"line_count >= {floor}" in body
     assert "%if" not in cleaned
     assert "line_count" not in cleaned
+    assert "%queue(" not in cleaned
     assert f"#split_file:{path}" in cleaned
     return cleaned, body
 
@@ -174,6 +177,15 @@ def _assert_planned_prompts_use_medium_model(prompts: list[str]) -> None:
     parsed = [extract_prompt_directives(prompt)[1] for prompt in prompts]
     assert all(directives.model == "medium" for directives in parsed)
     assert all(getattr(directives, "model_alias", "medium") == "medium" for directives in parsed)
+
+
+def _assert_planned_prompts_use_lumberjack_wait_runners(prompts: list[str]) -> None:
+    assert prompts
+    assert all(prompt.count("%queue(runners=3)") == 1 for prompt in prompts)
+    assert all("priority=" not in prompt for prompt in prompts)
+    parsed = [extract_prompt_directives(prompt)[1] for prompt in prompts]
+    assert all(directives.wait_runners == 3 for directives in parsed)
+    assert all(directives.wait_priority is None for directives in parsed)
 
 
 def _keyed_markers(value: str) -> list[str]:
@@ -617,9 +629,10 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
     )
     authored_summary = result["proposed_launches"][0]["clan_summary"]
     _assert_raw_proposals_use_medium_model(result["proposed_launches"])
-    prepared = prepare_chop_proposals("toobig_split", result)
+    prepared = prepare_chop_proposals("toobig_split", result, lumberjack_wait_runners=3)
     assert {proposal.clan_summary for proposal in prepared} == {authored_summary}
     assert all(proposal.model == PROPOSAL_MODEL for proposal in prepared)
+    assert all(proposal.wait_runners == 3 for proposal in prepared)
 
     _freeze_agent_name_allocation(monkeypatch)
 
@@ -638,6 +651,7 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
         assert f"%clan(toobig-0, tribe=chop, summary=[[{authored_summary}]])" in plans[0].prompt
         assert all("summary=[[" not in plan.prompt for plan in plans[1:])
         _assert_planned_prompts_use_medium_model([plan.prompt for plan in plans])
+        _assert_planned_prompts_use_lumberjack_wait_runners([plan.prompt for plan in plans])
 
         parsed = [extract_prompt_directives(plan.prompt)[1] for plan in plans]
         assert parsed[0].clan_declared
@@ -657,6 +671,7 @@ def test_sase_planning_emits_one_summary_and_promotes_a_surviving_tail(
         assert [plan.clan_summary for plan in tail_plans] == [authored_summary, None]
         assert extract_prompt_directives(tail_plans[0].prompt)[1].clan_summary == authored_summary
         _assert_planned_prompts_use_medium_model([plan.prompt for plan in tail_plans])
+        _assert_planned_prompts_use_lumberjack_wait_runners([plan.prompt for plan in tail_plans])
 
 
 def test_custom_tree_limits_and_legacy_env_target_resolution(
@@ -1130,11 +1145,18 @@ def test_sase_bridge_skips_stale_queued_files_without_agent_launch(
         raise AssertionError("stale toobig_split proposal allocated an agent")
 
     with override_flags(typed_launch_units=True):
+        prepared = prepare_chop_proposals(
+            "toobig_split",
+            result,
+            lumberjack_wait_runners=3,
+        )
+        plans = plan_chop_proposals(prepared)
+        _assert_planned_prompts_use_lumberjack_wait_runners([plan.prompt for plan in plans])
         launches = launch_chop_proposals(
             lumberjack_name="maintenance",
             chop_name="toobig_split",
             run_id="run-stale",
-            proposals=prepare_chop_proposals("toobig_split", result),
+            proposals=prepared,
             launch_agent_from_cwd_fn=_unexpected_launch,
             launch_agents_from_cwd_fn=_unexpected_launch,
         )
@@ -1192,7 +1214,11 @@ def test_sase_bridge_launches_eligible_file_after_admission(
     _freeze_agent_name_allocation(monkeypatch)
 
     with override_flags(typed_launch_units=True):
-        prepared = prepare_chop_proposals("toobig_split", result)
+        prepared = prepare_chop_proposals(
+            "toobig_split",
+            result,
+            lumberjack_wait_runners=3,
+        )
         plans = plan_chop_proposals(prepared)
         planned = extract_prompt_directives(plans[0].prompt)[1]
         assert plans[0].agent_name == "toobig-0.large.0"
@@ -1200,6 +1226,9 @@ def test_sase_bridge_launches_eligible_file_after_admission(
         assert planned.clan_declared is True
         assert planned.clan_tribe == "chop"
         assert planned.clan_summary == authored_summary
+        assert planned.wait_runners == 3
+        assert planned.wait_priority is None
+        _assert_planned_prompts_use_lumberjack_wait_runners([plan.prompt for plan in plans])
 
         launches = launch_chop_proposals(
             lumberjack_name="maintenance",
@@ -1225,6 +1254,8 @@ def test_sase_bridge_launches_eligible_file_after_admission(
         assert "line_count" not in dispatched[0]
         directives = extract_prompt_directives(dispatched[0])[1]
         assert directives.name == "toobig-0.large.0"
+        assert directives.wait_runners == 3
+        assert directives.wait_priority is None
         assert "split_file" not in (directives.name or "")
         assert launches[0]["clan"] == "toobig-0"
         assert launches[0]["member_id"] == "large.0"
@@ -1268,10 +1299,15 @@ def test_sase_bridge_promotes_next_basename_member_when_first_skips(
     _freeze_agent_name_allocation(monkeypatch)
 
     with override_flags(typed_launch_units=True):
-        prepared = prepare_chop_proposals("toobig_split", result)
+        prepared = prepare_chop_proposals(
+            "toobig_split",
+            result,
+            lumberjack_wait_runners=3,
+        )
         plans = plan_chop_proposals(prepared)
         assert [plan.agent_name for plan in plans] == ["toobig-0.large.0", "toobig-0.shared.0"]
         assert [plan.declares_clan for plan in plans] == [True, False]
+        _assert_planned_prompts_use_lumberjack_wait_runners([plan.prompt for plan in plans])
         tail_plans = plan_chop_proposals([replace(prepared[1], wait_on=None)])
         tail = extract_prompt_directives(tail_plans[0].prompt)[1]
         assert tail_plans[0].agent_name == "toobig-0.shared.0"
@@ -1280,6 +1316,9 @@ def test_sase_bridge_promotes_next_basename_member_when_first_skips(
         assert tail.clan_declared is True
         assert tail.clan_tribe == "chop"
         assert tail.clan_summary == authored_summary
+        assert tail.wait_runners == 3
+        assert tail.wait_priority is None
+        _assert_planned_prompts_use_lumberjack_wait_runners([plan.prompt for plan in tail_plans])
 
         launches = launch_chop_proposals(
             lumberjack_name="maintenance",
@@ -1305,6 +1344,8 @@ def test_sase_bridge_promotes_next_basename_member_when_first_skips(
         assert "%if" not in dispatched[0]
         directives = extract_prompt_directives(dispatched[0])[1]
         assert directives.name is not None
+        assert directives.wait_runners == 3
+        assert directives.wait_priority is None
         assert "shared" in directives.name
         assert "large" not in directives.name
         assert "split_file" not in directives.name

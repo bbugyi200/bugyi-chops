@@ -39,7 +39,6 @@ DEFAULT_TREES = ("src", "tests")
 DEFAULT_LIMITS = (1000, 850, 700)
 DETAIL_LIMIT_CHARS = 500
 ENV_PREFIX = "SASE_TOOBIG_SPLIT_"
-LAUNCH_PRIORITY = 20
 CLAN_SUMMARY_WIDTH = 76
 CLAN_SUMMARY_MAX_ROWS = 10
 CLAN_SUMMARY_HEADER_STYLE = "bold #D75FFF"
@@ -342,7 +341,7 @@ def _admission_prompt(path: str, floor: int) -> str:
         "fi\n"
         "exit 1\n"
         "```\n"
-        f"%auto %queue(priority={LAUNCH_PRIORITY}) #split_file:{path}"
+        f"%auto #split_file:{path}"
     )
 
 
