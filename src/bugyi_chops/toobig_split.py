@@ -342,7 +342,7 @@ def _admission_prompt(path: str, floor: int) -> str:
         "fi\n"
         "exit 1\n"
         "```\n"
-        f"%auto %wait(priority={LAUNCH_PRIORITY}) #split_file:{path}"
+        f"%auto %queue(priority={LAUNCH_PRIORITY}) #split_file:{path}"
     )
 
 

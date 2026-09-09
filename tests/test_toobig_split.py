@@ -57,7 +57,7 @@ MISSION_LINES = [
 def _parse_condition_prompt(prompt: str, path: str, floor: int) -> tuple[str, str]:
     assert prompt.count("%if::") == 1
     assert prompt.count("```bash") == 1
-    assert prompt.endswith(f"%auto %wait(priority=20) #split_file:{path}")
+    assert prompt.endswith(f"%auto %queue(priority=20) #split_file:{path}")
     with override_flags(typed_launch_units=True):
         cleaned, directives = extract_prompt_directives(prompt)
     assert directives.if_code is not None
@@ -259,6 +259,17 @@ def _git_commit_all(repo: Path, message: str) -> None:
     _run_git(["commit", "-q", "-m", message], repo)
 
 
+def _git_push_main(repo: Path) -> None:
+    _run_git(["push", "-q", "origin", "main"], repo)
+
+
+def _init_bare_upstream(tmp_path: Path) -> Path:
+    upstream = tmp_path / "upstream.git"
+    _run_git(["init", "-q", "--bare", str(upstream)], tmp_path)
+    _run_git(["symbolic-ref", "HEAD", "refs/heads/main"], upstream)
+    return upstream
+
+
 def _write_project_file(path: Path, *, primary: Path) -> Path:
     path.write_text(
         "\n".join(
@@ -279,10 +290,13 @@ def _write_project_file(path: Path, *, primary: Path) -> Path:
 
 def _leaseable_repo(tmp_path: Path) -> Path:
     """A real git checkout that a condition-workspace lease can clone."""
+    upstream = _init_bare_upstream(tmp_path)
     repo = _prepare_repo(tmp_path)
     _init_git(repo)
     _git_commit_all(repo, "initial")
     _run_git(["branch", "-M", "main"], repo)
+    _run_git(["remote", "add", "origin", str(upstream)], repo)
+    _git_push_main(repo)
     return repo
 
 
@@ -293,10 +307,7 @@ def _stale_repo_behind_upstream(tmp_path: Path, paths: list[str]) -> Path:
     the configured upstream while ``repo`` -- the chop/source checkout that
     scans and proposes -- never pulls that push, so it stays stale.
     """
-    upstream = tmp_path / "upstream.git"
-    _run_git(["init", "-q", "--bare", str(upstream)], tmp_path)
-    _run_git(["symbolic-ref", "HEAD", "refs/heads/main"], upstream)
-
+    upstream = _init_bare_upstream(tmp_path)
     writer = tmp_path / "writer"
     _seed_tree(writer)
     _init_git(writer)
@@ -305,7 +316,7 @@ def _stale_repo_behind_upstream(tmp_path: Path, paths: list[str]) -> Path:
     _git_commit_all(writer, "oversized")
     _run_git(["branch", "-M", "main"], writer)
     _run_git(["remote", "add", "origin", str(upstream)], writer)
-    _run_git(["push", "-qu", "origin", "main"], writer)
+    _git_push_main(writer)
 
     repo = tmp_path / "repo"
     _run_git(["clone", "-q", str(upstream), str(repo)], tmp_path)
@@ -313,7 +324,7 @@ def _stale_repo_behind_upstream(tmp_path: Path, paths: list[str]) -> Path:
     for path in paths:
         _write_lines(writer / path, 699)
     _git_commit_all(writer, "split")
-    _run_git(["push", "-q", "origin", "main"], writer)
+    _git_push_main(writer)
 
     return repo
 
@@ -1157,6 +1168,7 @@ def test_sase_bridge_launches_eligible_file_after_admission(
     path = "src/pkg/large.py"
     _write_lines(repo / path, 700)
     _git_commit_all(repo, "large enough")
+    _git_push_main(repo)
     scanner = _fake_toobig(tmp_path)
     monkeypatch.setenv("BUGYI_TEST_TOOBIG_CALLS", str(tmp_path / "calls"))
     monkeypatch.setenv("BUGYI_TEST_TOOBIG_SRC", f"{path}\n")
@@ -1243,6 +1255,7 @@ def test_sase_bridge_promotes_next_basename_member_when_first_skips(
     authored_summary = result["proposed_launches"][0]["clan_summary"]
     _write_lines(repo / paths[0], 699)
     _git_commit_all(repo, "split large")
+    _git_push_main(repo)
     monkeypatch.setenv("SASE_HOME", str(tmp_path / ".sase"))
     monkeypatch.setenv("SASE_WORKSPACE_ROOT", str(tmp_path / "workspace_pool"))
     monkeypatch.setenv("SASE_PYTEST_SANDBOX_DIR", str(tmp_path))
