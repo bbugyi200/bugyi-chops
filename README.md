@@ -65,7 +65,7 @@ Axe invokes a configured script as `<script> --context <context.json>` and suppl
 `status` is `ok`, `no_op`, or `check_error`. Axe validates the entire result before it
 launches anything, injects the workspace/name/tribe scaffold, honors `wait_on`
 dependencies, filters duplicate proposals, and tracks linked agents through
-`action_succeeded` or `action_failed`. The prompts here may use inline xprompts such
+`action_succeeded` or `action_failed`. The prompts here may use inline macros such
 as `#pr` and `#split_file`; they never use forbidden standalone `#!workflow`
 references. This proposal contract governs `bugyi_chop_toobig_split`.
 `bugyi_chop_ci_watch` always returns an empty `proposed_launches` list.

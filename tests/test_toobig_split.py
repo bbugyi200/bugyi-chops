@@ -20,7 +20,11 @@ from sase.axe.chop_proposal_launch import launch_chop_proposals
 from sase.axe.chop_proposals import plan_chop_proposals, prepare_chop_proposals
 from sase.core.axe_chop_facade import validate_chop_result
 from sase.feature_flags import override_flags
-from sase.xprompt.directives import extract_prompt_directives
+
+try:
+    from sase.macro.directives import extract_prompt_directives
+except ImportError:  # older sase without the macro rename
+    from sase.xprompt.directives import extract_prompt_directives
 
 from bugyi_chops._common import safe_fragment
 from bugyi_chops.toobig_split import (
